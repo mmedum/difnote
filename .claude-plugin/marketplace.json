@@ -1,0 +1,17 @@
+{
+  "name": "difnote",
+  "description": "difnote, notes on the diff of what changed, for the prompt",
+  "owner": {
+    "name": "Mark Medum Bundgaard",
+    "url": "https://github.com/mmedum"
+  },
+  "plugins": [
+    {
+      "name": "difnote",
+      "source": "./",
+      "description": "Review the diff of what changed in the folders Claude works in since you last looked, write a note on any line or hunk, and get your notes in the prompt to edit and send back",
+      "category": "productivity",
+      "tags": ["review", "code-review", "diff", "notes", "tui"]
+    }
+  ]
+}

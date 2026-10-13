@@ -1,0 +1,50 @@
+{
+  "name": "difnote",
+  "version": "0.1.0",
+  "description": "Review the diff of what changed in the folders Claude works in since you last looked, write a note on any line or hunk, and get your notes in the prompt to edit and send back",
+  "author": {
+    "name": "Mark Medum Bundgaard",
+    "url": "https://github.com/mmedum"
+  },
+  "homepage": "https://github.com/mmedum/difnote",
+  "repository": "https://github.com/mmedum/difnote",
+  "license": "Apache-2.0",
+  "icon": "./.claude-plugin/icon.png",
+  "documentationUrl": "https://github.com/mmedum/difnote#readme",
+  "supportUrl": "https://github.com/mmedum/difnote/issues",
+  "privacyPolicyUrl": "https://github.com/mmedum/difnote#privacy",
+  "userConfig": {
+    "fileIcons": {
+      "type": "boolean",
+      "title": "File icons",
+      "description": "A Nerd Font icon before each file, in its language's color; turn off if your terminal's font has none",
+      "default": true
+    },
+    "addedColor": {
+      "type": "string",
+      "title": "Added color",
+      "description": "How many lines a file or hunk adds: a theme role such as success (the default) or diffAddedWord, or a color: #7ccf8a, rgb(124,207,138), ansi256(114) or ansi:green",
+      "default": "success"
+    },
+    "removedColor": {
+      "type": "string",
+      "title": "Removed color",
+      "description": "How many lines a file or hunk removes: a theme role such as error (the default) or diffRemovedWord, or a color: #e06c75, rgb(224,108,117), ansi256(167) or ansi:red",
+      "default": "error"
+    },
+    "noteColor": {
+      "type": "string",
+      "title": "Note color",
+      "description": "Your notes in the pane: a theme role such as suggestion (the default), claude or warning, or a color: #7aa2f7, rgb(122,162,247), ansi256(110) or ansi:cyan",
+      "default": "suggestion"
+    },
+    "quietColor": {
+      "type": "string",
+      "title": "Quiet color",
+      "description": "Folders, line numbers and hints: a theme role such as inactive (the default, Claude Code's color for hints) or subtle, or a color",
+      "default": "inactive"
+    }
+  },
+  "keywords": ["claude-code", "mod", "review", "code-review", "diff", "notes", "comments", "git", "tui"],
+  "types": "./types/index.d.ts"
+}

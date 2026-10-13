@@ -1,0 +1,20 @@
+name: Idea
+description: Something difnote could show
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What would it help you with?
+      description: The situation, not the solution. difnote stays quiet, so what you would want it to show, and where, matters most.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea
+  - type: textarea
+    id: elsewhere
+    attributes:
+      label: Seen elsewhere
+      description: A tool that does this well, if you know one.
