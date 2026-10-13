@@ -10,7 +10,7 @@ import { runGit } from './fakegit'
 
 export const CWD = '/home/demo/app'
 export const SESSION = 'session-1'
-const NOW = 3_600_000
+export const NOW = 3_600_000
 
 export type Project = Disk & {
   // The clock, which moves only when a test moves it; `settle` lets what
@@ -34,6 +34,12 @@ export type Project = Disk & {
   messages: SessionMessage[]
   opened: { focus: boolean }[]
   closed: string[]
+  // Whether the pane is open, and shown in front; what the person answers a
+  // question, and what they do while it is asked.
+  pane: { isOpen: boolean; isShown: boolean }
+  answer: string
+  asked: string[]
+  whileAsked: (() => Promise<void>) | null
 }
 
 export type StartOptions = {
@@ -49,7 +55,8 @@ export type StartOptions = {
   // What Claude Code stored of the conversation, for a session that resumes.
   messages?: SessionMessage[]
   stored?: Record<string, unknown>
-  // Claude Code's record of the pane, as $.ui.panes lists it.
+  // Claude Code's record of the pane, as $.ui.panes lists it: open, and
+  // shown in front or not.
   panes?: { isShown: boolean }[]
   // Prompts a hook beneath refuses, so Claude never gets them.
   refused?: string[]
@@ -79,6 +86,10 @@ export async function started($: Engine, on: On, options: StartOptions = {}): Pr
     messages: options.messages ?? [],
     opened: [],
     closed: [],
+    pane: { isOpen: options.panes !== undefined && options.panes.length > 0, isShown: options.panes?.[0]?.isShown ?? false },
+    answer: 'Mark reviewed',
+    asked: [],
+    whileAsked: null,
   }
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: SESSION }))
@@ -163,15 +174,26 @@ export async function started($: Engine, on: On, options: StartOptions = {}): Pr
   })
   on('ui.open', (_$, e) => {
     project.opened.push({ focus: e.focus === true })
+    project.pane = { isOpen: true, isShown: true }
     return { value: { isPlaced: true } }
   })
   on('ui.close', (_$, e) => {
     project.closed.push(e.id)
+    project.pane = { isOpen: false, isShown: false }
     return { value: undefined }
   })
   on('ui.panes', () => ({
-    value: (options.panes ?? []).map(({ isShown }) => ({ id: 'difnote', title: 'difnote', isShown, isFocused: false, isPlaced: true })),
+    value: project.pane.isOpen ? [{ id: 'difnote', title: 'difnote', isShown: project.pane.isShown, isFocused: false, isPlaced: true }] : [],
   }))
+  // The engine's question dialog, which $.ui.ask opens: the person answers.
+  on('tool.call', { tool: 'AskUserQuestion' }, async (_$, e) => {
+    const questions = Array.isArray(e.questions) ? e.questions : []
+    const first: unknown = questions[0]
+    const question = typeof first === 'object' && first !== null && 'question' in first && typeof first.question === 'string' ? first.question : ''
+    project.asked.push(question)
+    await project.whileAsked?.()
+    return { result: { questions, answers: { [question]: project.answer } } }
+  })
   on('prompt.read', () => ({ value: { text: project.draft.text, cursor: project.draft.text.length } }))
   on('prompt.fill', (_$, e) => {
     if (project.dialog.isOpen) {
@@ -351,15 +373,27 @@ export function command($: Engine) {
   return $.command.run({ command: 'difnote', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 120 } })
 }
 
-// The pane as a terminal docks it, `columns` wide.
-export function mount($: Engine, columns = 60) {
+// The pane as a terminal docks it, `columns` wide and `rows` high.
+export function mount($: Engine, columns = 60, rows = 40) {
   return $.ui.mount({
     plugin: 'difnote',
     surface: 'terminal',
     component: 'Pane',
     requestId: 'difnote',
-    props: { title: 'difnote', isFocused: true, bodyColumns: columns, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
+    props: { title: 'difnote', isFocused: true, bodyColumns: columns, placement: 'dock', scroll: { offset: 0, bodyRows: rows }, view: {} },
   })
+}
+
+// The pieces of code drawn, each with whether its lines wrap or are cut.
+export async function wrapsOf(ui: Mounted): Promise<unknown[]> {
+  return (await ui.findAll({ type: 'Code' })).map(code => code.props.wrap)
+}
+
+// How far each piece of code is moved over to line up with its hunk's gutter.
+export async function padsOf(ui: Mounted): Promise<unknown[]> {
+  const boxes = await ui.findAll({ type: 'Box' })
+  const isCode = (child: unknown) => typeof child === 'object' && child !== null && 'type' in child && child.type === 'Code'
+  return boxes.filter(box => box.children.some(isCode)).map(box => box.props.paddingLeft)
 }
 
 export type Mounted = Awaited<ReturnType<typeof mount>>
@@ -369,8 +403,62 @@ export async function textsOf(ui: Mounted): Promise<string[]> {
   return (await ui.findAll({ type: 'Text' })).map(text => text.text ?? '')
 }
 
-// The texts of the Buttons whose keys start with `prefix`, in order: the
-// list's files with `file:`, a picked hunk's lines with `line:`.
+// The list as drawn, each row without the cursor's column: the headings of
+// the folders files are watched in, of the folders in them, and the files.
+export async function listOf(ui: Mounted): Promise<string[]> {
+  const boxes = await ui.findAll({ type: 'Box' })
+  return boxes.filter(box => /^(root|dir|file):/.test(box.key ?? '')).map(box => box.text.slice(1))
+}
+
+// Everything the pane writes, as one line: prose wrapped over rows reads
+// whole.
+export async function shownOf(ui: Mounted): Promise<string> {
+  return (await ui.findAll({ type: 'Text' }))
+    .map(text => text.text)
+    .join(' ')
+    .replaceAll(/\s+/g, ' ')
+}
+
+// The key of the row the cursor's bar is on, if any.
+export async function cursorOf(ui: Mounted): Promise<string | undefined> {
+  const boxes = await ui.findAll({ type: 'Box' })
+  const row = boxes.find(box => {
+    const [bar] = box.children
+    return (
+      box.key !== undefined &&
+      !box.key.startsWith('sticky:') &&
+      typeof bar === 'object' &&
+      bar !== null &&
+      'children' in bar &&
+      Array.isArray(bar.children) &&
+      bar.children[0] === '▌'
+    )
+  })
+  return row?.key?.replace(/^code:/, '')
+}
+
+// Moves the cursor with the keys onto the row with `key`: up to the top,
+// then down until it is there.
+export async function goTo(ui: Mounted, key: string) {
+  for (let i = 0; i < 400; i += 1) {
+    const was = await cursorOf(ui)
+    await ui.press({ key: 'key-up' })
+    if ((await cursorOf(ui)) === was) {
+      break
+    }
+  }
+  for (let i = 0; i < 400 && (await cursorOf(ui)) !== key; i += 1) {
+    await ui.press({ key: 'key-down' })
+  }
+}
+
+// Opens a file under its row, as Enter on it does.
+export async function openFile(ui: Mounted, path: string) {
+  await goTo(ui, `file:${path}`)
+  await ui.press({ key: 'enter' })
+}
+
+// The texts of the Buttons whose keys start with `prefix`, in order.
 export async function buttonsOf(ui: Mounted, prefix: string): Promise<string[]> {
   const buttons = await ui.findAll({ type: 'Button' })
   return buttons.filter(button => button.key?.startsWith(prefix) === true).map(button => button.text ?? '')

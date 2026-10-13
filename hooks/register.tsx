@@ -2,9 +2,9 @@
 // reviewed, one diff per file, lets you write a note on a line, a hunk or a
 // file, and puts the notes into the prompt box for you to edit and send.
 
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, Timer } from 'claude-code'
 import { atom, read, update } from 'claude-code'
-import type { Change, FileDiff, Note, Watch } from '../types'
+import type { Change, FileDiff, Note, Place, Watch } from '../types'
 import type { Places } from './folders'
 import { isInside, parentOf, pathsIn, placesOf, refusalOf, slugOf } from './folders'
 import type { Entry } from './git'
@@ -27,26 +27,36 @@ import {
   under,
 } from './git'
 import { colorOf } from './paint'
-import { FIELD, paneOf, walkOf } from './pane'
-import type { Colors } from './pane'
-import { anchorOf, changeOf, docOf, filesOf, isRecord, promptOf, rowsOf, titleOf } from './review'
+import { ENTER, FIELD, FOLDER, groupsOf, layoutOf, paneOf } from './pane'
+import type { Actions, Colors, Item, Layout, PaneView } from './pane'
+import { anchorOf, changeOf, docOf, filesOf, fingerprintOf, isRecord, promptOf, rowsOf, titleOf } from './review'
 import type { Row } from './review'
 
 const NAME = 'difnote'
 const PANE = 'difnote'
 
 const diffs = atom({ plugin: 'difnote', key: 'diffs' } as const, [])
-const watch = atom({ plugin: 'difnote', key: 'watch' } as const, { hasGit: false, since: null, looking: [], skipped: [] })
+const watch = atom({ plugin: 'difnote', key: 'watch' } as const, {
+  hasGit: false,
+  since: null,
+  looking: [],
+  skipped: [],
+  slow: [],
+  carried: [],
+  lost: [],
+  roots: [],
+  home: null,
+})
 const changes = atom({ plugin: 'difnote', key: 'changes' } as const, [])
 const notes = atom({ plugin: 'difnote', key: 'notes' } as const, [])
 const editing = atom({ plugin: 'difnote', key: 'editing' } as const, null)
-const file = atom({ plugin: 'difnote', key: 'file' } as const, null)
+const place = atom({ plugin: 'difnote', key: 'place' } as const, { open: null, cursor: null, top: 0, isCompact: false, closed: [] })
+const viewed = atom({ plugin: 'difnote', key: 'viewed' } as const, {})
 
 // The room the pane asks for: columns docked beside the transcript, rows
 // seated above the prompt.
 const DOCK_COLUMNS = 100
 const INLINE_ROWS = 30
-const picking = atom({ plugin: 'difnote', key: 'picking' } as const, null)
 
 // Where each session's last review of Claude's Edit and Write records ended:
 // the id of the newest change it covered, by session id, for the sessions
@@ -59,11 +69,27 @@ const KEPT_BASELINES = 100
 // folder has its own.
 const NOTES = 'notes'
 
+// The files marked viewed, kept like the notes: by the session's folder.
+const VIEWED = 'viewed'
+
 // How long Claude's change waits for difnote to record a folder it hasn't
 // recorded before; and how old a look may be when a key is pressed in the
 // pane, as one back from behind another, before it looks again.
 const WAIT_MS = 5_000
 const STALE_MS = 2_000
+
+// An open pane looks again by itself, for changes no hook sees (yours, a
+// script's, another session's), POLL_MS after its last look ended, or PACE
+// times as long as that look took, if longer. A folder whose look took over
+// SLOW_MS SLOW_TIMES times is left to the looks Claude's changes and your
+// keys make.
+const POLL_MS = 10_000
+const PACE = 20
+const SLOW_MS = 3_000
+const SLOW_TIMES = 2
+
+// The answer to r's question that marks everything shown reviewed.
+const SURE = 'Mark reviewed'
 
 // The session's folder, which paths are written relative to; what the pane
 // has shown since the review began (the newest Edit or Write record, and
@@ -82,11 +108,17 @@ let early: ReadonlySet<string> = new Set()
 let titles: ReadonlyMap<string, string> = new Map()
 let isLooking = false
 let isAgain = false
-// How many reviews ended this session, so a look under way when one ends
-// knows its result is out of date.
+// Whether the pane is open; the look by itself it waits for; whether one
+// waited while a note was being written; and how long the last look took.
+let isOpen = false
+let timer: Timer | null = null
+let isHeld = false
+let lastLookMs = 0
+// How many reviews ended, or folders were let go of with x, this session,
+// so a look under way when one does knows its result is out of date.
 let reviews = 0
-let walk: string[] = []
-let ring: string | null = null
+// The list as last drawn: the keys and the wheel move the cursor over it.
+let layout: Layout | null = null
 
 // The changes to keep: each file's after-text only on its latest change,
 // the one the diff reads it from.
@@ -129,6 +161,16 @@ function listedFiles(found: readonly FileDiff[], list: readonly Change[]): FileD
 
 async function filesNow($: EngineInterface): Promise<FileDiff[]> {
   return listedFiles(await read($, diffs), await read($, changes))
+}
+
+// The rows of the files listed, worked out again only when they change: a
+// key that moves the cursor redraws without them.
+let rowsFor: { files: readonly FileDiff[] | null; rows: Row[] } = { files: null, rows: [] }
+function rowsOfFiles(files: readonly FileDiff[]): Row[] {
+  if (rowsFor.files !== files) {
+    rowsFor = { files, rows: rowsOf(files) }
+  }
+  return rowsFor.rows
 }
 
 // Claude's changes since the last review, from the conversation as Claude
@@ -181,6 +223,23 @@ function isNote(value: unknown): value is Note {
   )
 }
 
+// The files marked viewed, as the store keeps them.
+async function readViewed($: EngineInterface) {
+  const stored = await $.store.get(VIEWED).catch(() => undefined)
+  const own = isRecord(stored) ? stored[cwd] : undefined
+  const marks = isRecord(own) ? Object.entries(own).filter((entry): entry is [string, string] => typeof entry[1] === 'string') : []
+  await update($, viewed, () => Object.fromEntries(marks))
+}
+
+// Sets the files marked viewed, in the pane and in the store.
+async function setViewed($: EngineInterface, marks: Record<string, string>) {
+  await update($, viewed, () => marks)
+  const stored = await $.store.get(VIEWED).catch(() => undefined)
+  const others = Object.entries(isRecord(stored) ? stored : {}).filter(([folder]) => folder !== cwd)
+  const isEmpty = Object.keys(marks).length === 0
+  await $.store.set(VIEWED, Object.fromEntries([...others, ...(isEmpty ? [] : [[cwd, marks] as const])])).catch(() => undefined)
+}
+
 // Changes the notes, in the pane and in the store.
 async function setNotes($: EngineInterface, change: (list: Note[]) => Note[]) {
   let now: Note[] = []
@@ -194,22 +253,27 @@ async function setNotes($: EngineInterface, change: (list: Note[]) => Note[]) {
 }
 
 // Looks at the watched folders again; a look asked for while one is under
-// way runs after it.
-async function refresh($: EngineInterface) {
+// way runs after it. A look by itself (`isTimer`) records only the folders
+// git says changed, and redraws only when one did. The next look by itself
+// is set from when this one ends.
+async function refresh($: EngineInterface, isTimer = false) {
   if (isLooking) {
     isAgain = true
     return
   }
   isLooking = true
   const from = reviews
+  const startedAt = await $.clock.now()
   let now: Looked
   let ignoring: ReadonlySet<string>
   try {
     const paths = (await read($, changes)).map(change => change.path)
-    ;[now, ignoring] = await Promise.all([look($), ignoredOf($, paths)])
+    ;[now, ignoring] = await Promise.all([look($, isTimer), isTimer ? ignored : ignoredOf($, paths)])
   } finally {
     isLooking = false
   }
+  lookedAt = await $.clock.now()
+  lastLookMs = lookedAt - startedAt
   // A review that ended during the look made it out of date, states the
   // pane never showed: it is dropped, and the look made again.
   if (reviews !== from) {
@@ -217,15 +281,83 @@ async function refresh($: EngineInterface) {
     await refresh($)
     return
   }
+  const isSame = looked !== null && isSameLook(looked, now)
   looked = now
   ignored = ignoring
-  lookedAt = await $.clock.now()
-  await update($, diffs, () => filesOfLook(now))
-  await update($, watch, () => watchOf())
+  if (!isSame) {
+    const hadFiles = (await filesNow($)).length > 0
+    await update($, diffs, () => filesOfLook(now))
+    await parkWhenListed($, hadFiles)
+  }
+  const said = watchOf()
+  if (JSON.stringify(said) !== JSON.stringify(await read($, watch))) {
+    await update($, watch, () => said)
+  }
   if (isAgain) {
     isAgain = false
     await refresh($)
+    return
   }
+  schedule($)
+}
+
+// Whether a look found each folder as the last did.
+function isSameLook(was: Looked, now: Looked): boolean {
+  return (
+    was.files.size === now.files.size &&
+    [...now.files].every(([folder, files]) => was.files.get(folder) === files) &&
+    was.failed.length === now.failed.length &&
+    now.failed.every((one, i) => was.failed[i]?.folder === one.folder && was.failed[i]?.why === one.why)
+  )
+}
+
+// Sets the open pane's next look by itself, in place of any set before.
+function schedule($: EngineInterface) {
+  timer?.cancel()
+  timer = isOpen ? $.clock.after(Math.max(POLL_MS, PACE * lastLookMs), () => void tick($).catch(() => undefined)) : null
+}
+
+// The look by itself: none while one is under way (it sets the next); while
+// the pane is behind another tab, or a note is being written, the next is
+// set instead; a closed pane's ends.
+async function tick($: EngineInterface) {
+  timer = null
+  if (!isOpen || isLooking) {
+    return
+  }
+  if (!(await isShown($))) {
+    schedule($)
+  } else if ((await read($, editing)) !== null) {
+    isHeld = true
+    schedule($)
+  } else {
+    // A look that failed sets no next one: set here, the looks go on.
+    await refresh($, true).finally(() => {
+      if (timer === null) {
+        schedule($)
+      }
+    })
+  }
+}
+
+// Closes the note field; a look by itself held while it was open is made.
+async function closeField($: EngineInterface) {
+  await update($, editing, () => null)
+  if (isHeld) {
+    isHeld = false
+    if (isOpen) {
+      void refresh($, true).catch(() => undefined)
+    }
+  }
+}
+
+// The pane opened or closed: its looks by themselves start or stop.
+function setOpen($: EngineInterface, open: boolean) {
+  isOpen = open
+  if (!open) {
+    isHeld = false
+  }
+  schedule($)
 }
 
 async function isShown($: EngineInterface): Promise<boolean> {
@@ -253,10 +385,13 @@ async function endReview($: EngineInterface, upTo: string) {
 }
 
 // Marks what the pane showed reviewed: each folder as it was shown, and
-// Claude's records up to the newest shown. What changed since stays.
-async function markReviewed($: EngineInterface) {
-  const upTo = shownUpTo
-  const trees = shownTrees
+// Claude's records up to the newest shown; or what it showed when r was
+// pressed (`shown`). What changed since stays.
+async function markReviewed(
+  $: EngineInterface,
+  shown: { upTo: string | null; trees: ReadonlyMap<string, string> } = { upTo: shownUpTo, trees: shownTrees },
+) {
+  const { upTo, trees } = shown
   reviews += 1
   shownUpTo = null
   shownTrees = new Map()
@@ -271,9 +406,62 @@ async function markReviewed($: EngineInterface) {
   if (upTo !== null) {
     await endReview($, upTo)
   }
+  // What was marked viewed is reviewed now.
+  await setViewed($, {})
   if (await isShown($)) {
     void refresh($).catch(() => undefined)
   }
+}
+
+// r: asks first, as a review can't be undone; the keyboard goes back to
+// the pane after.
+async function confirmReviewed($: EngineInterface) {
+  // What the question is about: what the pane shows now, not what it may
+  // show by the answer.
+  const shown = { upTo: shownUpTo, trees: shownTrees }
+  const count = (await filesNow($)).length
+  const question = count === 1 ? 'Mark the 1 file shown reviewed?' : `Mark all ${count} files shown reviewed?`
+  const answer = await $.ui.ask(question, { options: [SURE, 'Cancel'], header: 'difnote' }).catch(() => '')
+  await openPane($).catch(() => undefined)
+  if (answer === SURE) {
+    await markReviewed($, shown)
+  }
+}
+
+// x: the outside folder the cursor is on, else the only one carried from
+// earlier sessions, no longer watched from here. Its changes leave the pane
+// and this review, unreviewed, and later sessions here leave it out until
+// Claude changes it again; a session in the folder itself still shows them.
+async function dropFolder($: EngineInterface) {
+  const list = (await read($, watch)).carried.map(one => one.folder)
+  const at = layout?.cursor ?? null
+  const target = at?.startsWith(FOLDER) === true ? at.slice(FOLDER.length) : list.length === 1 ? list[0] : undefined
+  if (target === undefined || !carried.has(target)) {
+    $.ui.toast('Move to a folder under "From earlier sessions here" first.')
+    return
+  }
+  const gone = new Set([...active].filter(folder => isInside(folder, target) && isOutside(folder)))
+  // A look under way still holds the folder: it is made again without it.
+  reviews += 1
+  for (const folder of gone) {
+    active.delete(folder)
+    carried.delete(folder)
+    quiet.delete(folder)
+    const one = times[folder]
+    if (one !== undefined) {
+      times[folder] = { ...one, from: one.from.filter(from => from !== cwd) }
+    }
+  }
+  await saveTimes($)
+  const keep = <T,>(map: ReadonlyMap<string, T>) => new Map([...map].filter(([folder]) => !gone.has(folder)))
+  shownTrees = keep(shownTrees)
+  if (looked !== null) {
+    const now: Looked = { ...looked, trees: keep(looked.trees), files: keep(looked.files) }
+    looked = now
+    await update($, diffs, () => filesOfLook(now))
+  }
+  await update($, watch, () => watchOf())
+  await park($)
 }
 
 // Puts the notes into the prompt box after what is there, a blank line
@@ -314,30 +502,17 @@ async function saveNote($: EngineInterface, row: Row, text: string) {
     const at = list.findIndex(one => one.target === row.key)
     return at < 0 ? [...list, note] : list.map(one => (one.target === row.key ? note : one))
   })
-  await update($, editing, () => null)
-  await $.ui.focus({ requestId: PANE, key: row.key }).catch(() => undefined)
+  await closeField($)
+  await park($)
 }
 
-// The person's own prompt to Claude after the pane showed the changes ends
-// that review, unless notes are still waiting to go into the prompt box.
-async function promptSent($: EngineInterface) {
-  if ((await read($, notes)).length === 0) {
-    await markReviewed($)
-  }
-}
-
-// /difnote closes the pane when it is the one shown, else opens it with
-// the keyboard and looks again.
-async function togglePane($: EngineInterface) {
-  const pane = (await $.ui.panes().catch(() => [])).find(one => one.id === PANE)
-  if (pane?.isShown === true && pane.isPlaced) {
-    // Forgotten first, so the close isn't taken for a step back.
-    await forget($)
-    await $.ui.close({ id: PANE })
-  } else {
-    await openPane($)
-    void refresh($).catch(() => undefined)
-  }
+// /difnote gives the pane the keyboard, opening it, bringing it to the
+// front of the dock or taking the keyboard back from the prompt, and looks
+// again. Esc closes the pane (see stepBack).
+async function showPane($: EngineInterface) {
+  await openPane($)
+  setOpen($, true)
+  void refresh($).catch(() => undefined)
 }
 
 async function openField($: EngineInterface, row: Row) {
@@ -345,102 +520,313 @@ async function openField($: EngineInterface, row: Row) {
   await $.ui.focus({ requestId: PANE, key: FIELD }).catch(() => undefined)
 }
 
-// Opens the pane with the keyboard. Esc steps back (see stepBack). Docked,
-// the pane asks for room for code; a width the person set the dock to wins.
+// Opens the pane with the keyboard, on the button Enter presses, or on a
+// note field left open: none is drawn for Enter while one is, and a park
+// would wait for it, the keyboard at the prompt meanwhile. Esc steps back
+// (see stepBack). Docked, the pane asks for room for code; a width the
+// person set the dock to wins.
 async function openPane($: EngineInterface) {
   await $.ui.open({ id: PANE, title: 'difnote', focus: true, closeOnEscape: true, columns: DOCK_COLUMNS, rows: INLINE_ROWS })
+  if ((await read($, editing)) !== null) {
+    await $.ui.focus({ requestId: PANE, key: FIELD }).catch(() => undefined)
+  } else {
+    await park($)
+  }
 }
 
-// Esc, the close mark or another plugin's close while the pane is open (its
-// own /difnote closes it outright): one step back, the way
-// /diff's dialog goes. A note field closes, leaving the note as it was;
-// picking a line stops; a file goes back to the list. Only from the list
-// does the pane close.
-async function stepBack($: EngineInterface) {
-  const field = await read($, editing)
-  if (field !== null) {
-    await update($, editing, () => null)
-    await ringTo($, field)
+// Puts Claude Code's focus ring on the button Enter presses, where it stays
+// while difnote moves its own cursor: a ring on rows that come and go would
+// be kept at its place among them, not on its row.
+async function park($: EngineInterface) {
+  await $.ui.focus({ requestId: PANE, key: ENTER }).catch(() => undefined)
+}
+
+// An empty pane draws no button for Enter, so a park found nothing to put
+// the ring on: once files show, the ring goes onto the button, if the pane
+// has the keyboard (a park never takes it from the prompt).
+async function parkWhenListed($: EngineInterface, hadFiles: boolean) {
+  if (hadFiles || (await filesNow($)).length === 0) {
     return
   }
-  await goBack($)
+  const pane = (await $.ui.panes().catch(() => [])).find(one => one.id === PANE)
+  if (pane?.isFocused === true) {
+    await park($)
+  }
+}
+
+// Esc, the close mark or another plugin's close while the pane is open: one
+// step back, the way /diff's dialog goes. A note field closes, leaving the
+// note as it was; an open file closes, the cursor on its row. Only then does
+// the pane close.
+async function stepBack($: EngineInterface) {
+  if ((await read($, editing)) !== null) {
+    await closeField($)
+    await park($)
+    return
+  }
+  const { open } = await read($, place)
+  if (open !== null) {
+    await moveTo($, `file:${open}`, { open: null })
+  }
 }
 
 // Whether there is a step to take back before the pane closes.
 async function hasStep($: EngineInterface): Promise<boolean> {
-  return (await read($, editing)) !== null || (await read($, picking)) !== null || (await read($, file)) !== null
+  return (await read($, editing)) !== null || (await read($, place)).open !== null
 }
 
-// Closed, the pane forgets the file it had open, the hunk being picked from
-// and an open note field: opened again, it starts on the list.
+// Closed, the pane forgets the file it had open, its cursor and an open note
+// field: opened again, it starts at the top of the list.
 async function forget($: EngineInterface) {
-  await update($, editing, () => null)
-  await update($, picking, () => null)
-  await update($, file, () => null)
-  ring = null
+  await closeField($)
+  await update($, place, was => ({ ...was, open: null, cursor: null, top: 0 }))
 }
 
-// Moves the focus ring onto an element of the pane, as the person's arrows
-// would; the pane keeps the ring where it was put when it redraws.
-async function ringTo($: EngineInterface, key: string) {
-  ring = key
-  await $.ui.focus({ requestId: PANE, key }).catch(() => undefined)
+// Puts the cursor on a row, with other changes to where the person is; the
+// window keeps showing what it showed, moved only as far as the cursor needs.
+async function moveTo($: EngineInterface, key: string | null, change: Partial<Place> = {}) {
+  const top = layout?.top ?? 0
+  await update($, place, was => ({ ...was, top, ...change, cursor: key }))
+  await park($)
 }
 
-// Opens a file, the ring on its first hunk.
-async function openFile($: EngineInterface, path: string) {
-  await update($, editing, () => null)
-  await update($, picking, () => null)
-  await update($, file, () => path)
-  const first = rowsOf(await filesNow($)).find(row => row.file.path === path && row.kind === 'hunk')
-  await ringTo($, first?.key ?? `file:${path}`)
+// The item a key names in the list as last drawn.
+function itemOf(key: string | null): Item | undefined {
+  return key === null ? undefined : layout?.items.find(item => item.key === key)
 }
 
-// h: out of picking a line, else back to the list, the ring on the file it
-// came from.
-async function goBack($: EngineInterface) {
-  await update($, editing, () => null)
-  const hunk = await read($, picking)
-  if (hunk !== null) {
-    await update($, picking, () => null)
-    await ringTo($, hunk)
+// The stop `step` stops from the cursor, held at the ends; from none, the
+// first or the last.
+function stopFrom(step: number): string | null {
+  const stops = layout?.stops ?? []
+  if (stops.length === 0) {
+    return null
+  }
+  const at = layout?.cursor === null || layout === null ? -1 : stops.indexOf(layout.cursor)
+  const to = at < 0 ? (step > 0 ? 0 : stops.length - 1) : Math.min(stops.length - 1, Math.max(0, at + step))
+  return stops[to] ?? null
+}
+
+// The key of the folder heading a file is listed under, if any.
+async function headingOf(path: string, $: EngineInterface): Promise<string | null> {
+  const groups = groupsOf(await filesNow($), await read($, watch))
+  for (const group of groups) {
+    for (const dir of group.dirs) {
+      if (dir.dir !== '' && dir.files.some(one => one.path === path)) {
+        return dir.key
+      }
+    }
+  }
+  return null
+}
+
+// Opens a file under its row, closing the one open; its folder opens if
+// folded. The cursor goes to its first changed line, else its row.
+async function openAt($: EngineInterface, path: string) {
+  await closeField($)
+  const rows = rowsOfFiles(await filesNow($))
+  const first = rows.find(row => row.file.path === path && row.kind === 'line') ?? rows.find(row => row.file.path === path && row.kind === 'hunk')
+  const dir = await headingOf(path, $)
+  const { closed } = await read($, place)
+  await moveTo($, first?.key ?? `file:${path}`, { open: path, closed: closed.filter(one => one !== dir) })
+}
+
+// Enter, on the button the ring stays on: what the cursor's row offers. A
+// file opens or closes; a folder heading folds or unfolds its files; a
+// folder from earlier sessions opens its newest file; a hunk or a line
+// takes a note.
+async function act($: EngineInterface) {
+  const item = itemOf(layout?.cursor ?? null)
+  const was = await read($, place)
+  if (item?.kind === 'file') {
+    await (was.open === item.file.path ? moveTo($, item.key, { open: null }) : openAt($, item.file.path))
+  } else if (item?.kind === 'dir') {
+    await toggleDir($, item)
+  } else if (item?.kind === 'folder') {
+    const newest = (await filesNow($)).filter(one => isInside(one.path, item.folder)).toSorted((x, y) => y.changedAt - x.changedAt)[0]
+    if (newest !== undefined) {
+      await openAt($, newest.path)
+    }
+  } else if (item?.kind === 'hunk' || item?.kind === 'code') {
+    await noteOn($, item.key)
+  }
+}
+
+// Folds a folder's files away, closing the file open in it; or unfolds them.
+async function toggleDir($: EngineInterface, item: Extract<Item, { kind: 'dir' }>) {
+  const was = await read($, place)
+  const isClosing = !was.closed.includes(item.key)
+  const isOpenInside = isClosing && was.open !== null && (await headingOf(was.open, $)) === item.key
+  await moveTo($, item.key, {
+    closed: isClosing ? [...was.closed, item.key] : was.closed.filter(one => one !== item.key),
+    ...(isOpenInside ? { open: null } : {}),
+  })
+}
+
+// h: out one level. From inside the open file, close it, the cursor on its
+// row; on the open file's row, close it; on a file in a folder, to the
+// folder's heading; on an unfolded heading, fold it.
+async function goOut($: EngineInterface) {
+  const item = itemOf(layout?.cursor ?? null)
+  const was = await read($, place)
+  if ((item?.kind === 'hunk' || item?.kind === 'code') && was.open !== null) {
+    await moveTo($, `file:${was.open}`, { open: null })
+  } else if (item?.kind === 'file' && was.open === item.file.path) {
+    await moveTo($, item.key, { open: null })
+  } else if (item?.kind === 'file' && item.indent > 0) {
+    await moveTo($, await headingOf(item.file.path, $))
+  } else if (item?.kind === 'dir' && !item.isClosed) {
+    await toggleDir($, item)
+  }
+}
+
+// l: in one level. A file opens; on the open file's row, to its first
+// changed line; on a hunk header, to its first changed line; a folded
+// heading unfolds.
+async function goIn($: EngineInterface) {
+  const item = itemOf(layout?.cursor ?? null)
+  const was = await read($, place)
+  if (item?.kind === 'file' && was.open !== item.file.path) {
+    await openAt($, item.file.path)
+  } else if (item?.kind === 'file') {
+    const first = rowsOfFiles(await filesNow($)).find(row => row.file.path === item.file.path && row.kind === 'line')
+    await moveTo($, first?.key ?? item.key)
+  } else if (item?.kind === 'hunk') {
+    const own = rowsOfFiles(await filesNow($))
+    const at = own.findIndex(row => row.key === item.key)
+    const first = own.slice(at + 1).find(row => row.kind === 'line' || row.kind === 'hunk')
+    await moveTo($, first?.kind === 'line' ? first.key : item.key)
+  } else if (item?.kind === 'dir' && item.isClosed) {
+    await toggleDir($, item)
+  }
+}
+
+// n: the next file in the list opens, the one open closing; the last stays.
+async function nextFile($: EngineInterface) {
+  const order = layout?.order ?? []
+  const { open } = await read($, place)
+  const item = itemOf(layout?.cursor ?? null)
+  const from = open ?? (item?.kind === 'file' ? item.file.path : null)
+  const at = order.findIndex(one => one.path === from)
+  const next = order[at + 1]
+  if (next !== undefined) {
+    await openAt($, next.path)
+  }
+}
+
+// v: the cursor's file marked viewed, or no longer: its row dims, and the
+// mark drops by itself once its change changes. Marked, an open file
+// closes and the cursor goes on to the next file not yet viewed.
+async function toggleViewed($: EngineInterface) {
+  const item = itemOf(layout?.cursor ?? null)
+  const was = await read($, place)
+  const path = item?.kind === 'file' ? item.file.path : item?.kind === 'hunk' || item?.kind === 'code' ? was.open : null
+  const file = (await filesNow($)).find(one => one.path === path)
+  if (file === undefined) {
     return
   }
-  const was = await read($, file)
-  await update($, file, () => null)
-  if (was !== null) {
-    await ringTo($, `file:${was}`)
-  }
-}
-
-// Enter on a hunk header: its lines one to a row, to pick one, the ring on
-// its first changed line; again, back to the highlighted code.
-async function togglePicking($: EngineInterface, hunk: string) {
-  await update($, editing, () => null)
-  const was = await read($, picking)
-  await update($, picking, () => (was === hunk ? null : hunk))
-  const own = rowsOf(await filesNow($))
-  const at = own.findIndex(row => row.key === hunk)
-  const first = was === hunk ? undefined : own.slice(at + 1).find(row => row.kind === 'line' || row.kind === 'hunk')
-  await ringTo($, first?.kind === 'line' ? first.key : hunk)
-}
-
-// j and k: the next or previous row the keys walk, from the one the ring is
-// on; from none, the first or the last.
-async function moveRing($: EngineInterface, step: number) {
-  if (walk.length === 0) {
+  const marks = await read($, viewed)
+  const print = fingerprintOf(file)
+  if (marks[file.path] === print) {
+    await setViewed($, Object.fromEntries(Object.entries(marks).filter(([one]) => one !== file.path)))
+    await moveTo($, `file:${file.path}`)
     return
   }
-  const at = ring === null ? -1 : walk.indexOf(ring)
-  const to = at < 0 ? (step > 0 ? 0 : walk.length - 1) : Math.min(walk.length - 1, Math.max(0, at + step))
-  await ringTo($, walk[to] ?? walk[0] ?? '')
+  await setViewed($, { ...marks, [file.path]: print })
+  const order = layout?.order ?? []
+  const at = order.findIndex(one => one.path === file.path)
+  const next = order.slice(at + 1).find(one => marks[one.path] !== fingerprintOf(one))
+  const dir = next === undefined ? null : await headingOf(next.path, $)
+  await moveTo($, `file:${(next ?? file).path}`, {
+    ...(was.open === file.path ? { open: null } : {}),
+    closed: was.closed.filter(one => one !== dir),
+  })
 }
 
-// c: a note on the row the ring is on: a file, a hunk or a changed line.
-async function noteHere($: EngineInterface) {
-  const row = rowsOf(await filesNow($)).find(one => one.key === ring)
+// w: lines other than the cursor's cut to one row, or wrapped again.
+async function toggleWrap($: EngineInterface) {
+  const was = await read($, place)
+  await moveTo($, layout?.cursor ?? was.cursor, { isCompact: !was.isCompact })
+}
+
+// c: a note on the row the cursor is on: a file, a hunk or a changed line.
+async function noteOn($: EngineInterface, key: string | null) {
+  const row = rowsOfFiles(await filesNow($)).find(one => one.key === key)
   if (row !== undefined) {
     await openField($, row)
+  }
+}
+
+// The person's wheel, arrows, page keys, Home and End over the pane, which
+// difnote scrolls itself. The wheel moves the window three rows a tick and
+// takes the cursor along when it would leave it; an arrow moves the cursor
+// a stop, a page key about a window, Home and End to the first or last.
+async function scrolled($: EngineInterface, by: number, isWheel: boolean, contentRows: number) {
+  if (layout === null || by === 0) {
+    return
+  }
+  const { items, stops, window } = layout
+  const step = Math.sign(by)
+  if (isWheel) {
+    let top = layout.top
+    for (let rows = 0; rows < 3 * Math.abs(by);) {
+      const next = top + step
+      if (next < 0 || next >= items.length) {
+        break
+      }
+      rows += (step > 0 ? items[top] : items[next])?.rows ?? 1
+      top = next
+    }
+    const shown: string[] = []
+    for (let i = top, rows = 0; i < items.length && rows < window; i += 1) {
+      const item = items[i]
+      if (item !== undefined) {
+        rows += item.rows
+        if (stops.includes(item.key)) {
+          shown.push(item.key)
+        }
+      }
+    }
+    const cursor = layout.cursor !== null && shown.includes(layout.cursor) ? layout.cursor : step > 0 ? shown[0] : shown.at(-1)
+    await update($, place, was => ({ ...was, top, cursor: cursor ?? was.cursor }))
+    await park($)
+    return
+  }
+  if (Math.abs(by) === 1) {
+    await moveTo($, stopFrom(step))
+  } else if (Math.abs(by) >= contentRows) {
+    await moveTo($, (step > 0 ? stops.at(-1) : stops[0]) ?? null)
+  } else {
+    const at = items.findIndex(item => item.key === layout?.cursor)
+    let i = Math.max(0, at)
+    for (let rows = 0; rows < window - 2 && i + step >= 0 && i + step < items.length;) {
+      i += step
+      rows += items[i]?.rows ?? 1
+    }
+    while (i >= 0 && i < items.length && !stops.includes(items[i]?.key ?? '')) {
+      i -= step
+    }
+    await moveTo($, items[i]?.key ?? stopFrom(step))
+  }
+}
+
+// What the pane's keys and its note field do.
+function actionsOf($: EngineInterface, rows: readonly Row[]): Actions {
+  const run = (work: () => Promise<unknown>) => () => void work().catch(() => undefined)
+  return {
+    act: run(() => act($)),
+    down: run(() => moveTo($, stopFrom(1))),
+    up: run(() => moveTo($, stopFrom(-1))),
+    out: run(() => goOut($)),
+    in: run(() => goIn($)),
+    note: run(() => noteOn($, layout?.cursor ?? null)),
+    next: run(() => nextFile($)),
+    wrap: run(() => toggleWrap($)),
+    viewed: run(() => toggleViewed($)),
+    send: run(() => sendNotes($, rows)),
+    reviewed: run(() => confirmReviewed($)),
+    drop: run(() => dropFolder($)),
+    save: (row, text) => void saveNote($, row, text).catch(() => undefined),
   }
 }
 
@@ -495,14 +881,58 @@ type Folder = Watched | { folder: string; state: 'skipped'; why: string }
 // with why.
 type Looked = { trees: Map<string, string>; files: Map<string, FileDiff[]>; failed: { folder: string; why: string }[] }
 
-// When each folder's reviewed state was recorded, when a session last used
-// it and when its git folder was last tidied, by folder: kept in the store,
-// so a folder unused for long can be emptied.
-type Times = { baseAt: number; usedAt: number; tidiedAt: number }
+// When each folder's reviewed state was recorded, when it was last used and
+// when its git folder was last tidied, what kind of folder it is, the
+// folders of the sessions it carries changes for, and how many changed
+// files the last look found, by folder: kept in the store, so a folder
+// unused for long can be emptied, and a later session in a folder that
+// Claude changed another from watches that one again while its changes wait
+// for review. Used means Claude changed it, a review covered it or a session
+// started in it; a look is no use.
+type Times = { baseAt: number; usedAt: number; tidiedAt: number; kind: Watched['kind']; from: string[]; pending: number }
 const FOLDERS = 'folders'
 
-function isTimes(value: unknown): value is Times {
-  return isRecord(value) && typeof value.baseAt === 'number' && typeof value.usedAt === 'number' && typeof value.tidiedAt === 'number'
+// The most session folders a folder carries changes for.
+const MOST_FROM = 20
+
+// Folder times as the store keeps them; kind, from and pending may be missing.
+function timesOf(value: unknown): Times | null {
+  if (!isRecord(value) || typeof value.baseAt !== 'number' || typeof value.usedAt !== 'number' || typeof value.tidiedAt !== 'number') {
+    return null
+  }
+  const kind = value.kind === 'repository' || value.kind === 'files' ? value.kind : 'folder'
+  const from = Array.isArray(value.from) ? value.from.filter(one => typeof one === 'string') : []
+  const pending = typeof value.pending === 'number' ? value.pending : 0
+  return { baseAt: value.baseAt, usedAt: value.usedAt, tidiedAt: value.tidiedAt, kind, from, pending }
+}
+
+// A folder's times as kept, or new ones from `now`.
+function timesFor(folder: string, now: number): Times {
+  const one = folders.get(folder)
+  const kind = one?.state === 'watched' ? one.kind : 'folder'
+  return times[folder] ?? { baseAt: now, usedAt: now, tidiedAt: now, kind, from: [], pending: 0 }
+}
+
+// Whether a folder is outside the session's own: not it, nor in it.
+function isOutside(folder: string): boolean {
+  return sessionFolder !== '' && !isInside(folder, sessionFolder)
+}
+
+// After Claude changed files in the folders found: each used now, with
+// changes to review; one outside the session's folder is watched again by
+// later sessions here until a look finds nothing in it left to review.
+async function touched($: EngineInterface, found: readonly (Folder | null)[]) {
+  const used = found.filter((one): one is Watched => one?.state === 'watched')
+  if (used.length === 0) {
+    return
+  }
+  const now = await $.clock.now()
+  for (const { folder } of used) {
+    const was = timesFor(folder, now)
+    const from = isOutside(folder) ? [...new Set([...was.from, cwd])].slice(-MOST_FROM) : was.from
+    times[folder] = { ...was, usedAt: now, pending: Math.max(was.pending, 1), from }
+  }
+  await saveTimes($)
 }
 
 const UNUSED_MS = 30 * 24 * 60 * 60 * 1000
@@ -526,10 +956,25 @@ const folders = new Map<string, Folder>()
 const active = new Set<string>()
 // Each folder's repository top, null for none, as git answered.
 const tops = new Map<string, string | null>()
-// The placeholders recorded, by path: their text and git's id for it.
-const placeholders = new Map<string, { text: string; id: string }>()
+// The placeholders recorded, by path: their text, git's id for it, and the
+// size and time it was recorded with.
+const placeholders = new Map<string, { text: string; id: string; size: number; changedAt: number }>()
 const looking = new Set<string>()
 let times: Record<string, Times> = {}
+// The session's own folder: its repository's top, else the session's.
+let sessionFolder = ''
+// What each folder's last full look left: the repositories git lists in it,
+// and the ids of its reviewed state and of the state it recorded. A look by
+// itself that finds all three the same, and no file but placeholders
+// differing from the record, keeps the result. Another session in the same
+// folder shares the record, and moves the recorded state when it looks.
+const quiet = new Map<string, { nested: string; base: string; shown: string }>()
+// How many of each folder's looks took over SLOW_MS.
+const slowness = new Map<string, number>()
+// The outside folders earlier sessions here left changes in, watched again;
+// and the folders emptied at the start that still held changes not reviewed.
+const carried = new Set<string>()
+let lost: string[] = []
 // The folders emptied this session, for git to pack their git folders.
 const emptied = new Set<string>()
 
@@ -543,16 +988,39 @@ let failed: { folder: string; why: string }[] = []
 // look couldn't reach, the folders being recorded for the first time, and
 // when the oldest state it compares against was recorded.
 function watchOf(): Watch {
-  const own = [...active].flatMap(folder => {
+  const mine = [...active].flatMap(folder => {
     const one = folders.get(folder)
     return one === undefined ? [] : [one]
   })
-  const since = own.flatMap(one => {
+  const since = mine.flatMap(one => {
     const time = one.state === 'watched' && one.hasBase ? times[one.folder] : undefined
     return time === undefined ? [] : [time.baseAt]
   })
-  const skipped = own.flatMap(one => (one.state === 'skipped' ? [{ folder: one.folder, why: one.why }] : []))
-  return { hasGit, since: since.length === 0 ? null : Math.min(...since), looking: [...looking], skipped: [...skipped, ...failed] }
+  const skipped = mine.flatMap(one => (one.state === 'skipped' ? [{ folder: one.folder, why: one.why }] : []))
+  return {
+    hasGit,
+    since: since.length === 0 ? null : Math.min(...since),
+    looking: [...looking],
+    skipped: [...skipped, ...failed],
+    slow: [...active].filter(isSlow),
+    carried: [...carried].filter(folder => active.has(folder)).map(folder => ({ folder, usedAt: times[folder]?.usedAt ?? 0 })),
+    lost,
+    roots: rootsOf(mine),
+    home: places.home,
+  }
+}
+
+// The folders the pane groups files under: the session's, its
+// repository's top when that is above it, and each watched folder outside
+// it that no other one holds.
+function rootsOf(mine: readonly Folder[]): string[] {
+  const outside = mine.flatMap(one => (one.state === 'watched' && isOutside(one.folder) ? [one.folder] : []))
+  const outermost = outside.filter(folder => !outside.some(other => other !== folder && isInside(folder, other)))
+  return [cwd, ...(sessionFolder !== '' && sessionFolder !== cwd ? [sessionFolder] : []), ...outermost.toSorted()]
+}
+
+function isSlow(folder: string): boolean {
+  return (slowness.get(folder) ?? 0) >= SLOW_TIMES
 }
 
 function changed($: EngineInterface) {
@@ -569,6 +1037,11 @@ async function startWatching($: EngineInterface): Promise<void> {
   placeholders.clear()
   active.clear()
   looking.clear()
+  quiet.clear()
+  slowness.clear()
+  carried.clear()
+  lost = []
+  sessionFolder = ''
   failed = []
   hasGit = await git($, 'version', cwd).then(
     ran => ran.exitCode === 0,
@@ -578,33 +1051,69 @@ async function startWatching($: EngineInterface): Promise<void> {
     return
   }
   const stored = await $.store.get(FOLDERS).catch(() => undefined)
-  times = Object.fromEntries(Object.entries(isRecord(stored) ? stored : {}).filter((entry): entry is [string, Times] => isTimes(entry[1])))
+  times = Object.fromEntries(
+    Object.entries(isRecord(stored) ? stored : {}).flatMap(([folder, value]) => {
+      const one = timesOf(value)
+      return one === null ? [] : [[folder, one] as const]
+    }),
+  )
   const asked = await git($, 'excludes', cwd).catch(() => null)
   excludesFile = asked?.exitCode === 0 && asked.stdout.trim() !== '' ? asked.stdout.trim() : null
   // Folders unused for long are emptied first, before any can be watched
   // again; the rest of the tidying goes on in the background.
   await letGo($).catch(() => undefined)
+  if (lost.length > 0) {
+    $.ui.toast(`Emptied after 30 days unused, with changes you hadn't reviewed: ${lost.join(', ')}`)
+  }
   const top = await topOf($, cwd)
-  const own = follow($, top ?? cwd, top === null ? 'folder' : 'repository')
+  sessionFolder = top ?? cwd
+  const mine = follow($, sessionFolder, top === null ? 'folder' : 'repository')
+  const now = await $.clock.now()
+  // A session starting here uses its folder and the repositories in it.
+  for (const [folder, one] of Object.entries(times)) {
+    if (!isOutside(folder)) {
+      one.usedAt = now
+    }
+  }
+  await saveTimes($)
+  // The folders outside it that Claude changed from here, and whose changes
+  // wait for review, watched again: they show, as in the session that made
+  // the change. One that is no longer a repository is, as any folder outside
+  // the session's, watched for Claude's own files only.
+  const wanted = Object.entries(times).filter(([folder, one]) => isOutside(folder) && one.from.includes(cwd) && now - one.usedAt <= UNUSED_MS)
+  const found = await Promise.all(
+    wanted.map(async ([folder]) => ((await $.fs.exists(folder).catch(() => false)) ? { folder, top: await topOf($, folder) } : null)),
+  )
+  for (const one of found) {
+    if (one !== null) {
+      follow($, one.folder, one.top === one.folder ? 'repository' : 'files')
+      carried.add(one.folder)
+    }
+  }
   // Tidying waits for the session's folder's first record, so their git
   // calls don't hold each other's locks.
-  void (own.state === 'watched' ? own.ready : Promise.resolve(false)).then(() => tidy($)).catch(() => undefined)
+  void (mine.state === 'watched' ? mine.ready : Promise.resolve(false)).then(() => tidy($)).catch(() => undefined)
 }
 
 // Before Claude changes the files at `paths`: the folders they are in,
 // watched from now on, each recorded first if it has no record yet, waiting
 // up to `waitMs`. A shell command's paths count only in a git repository or
 // a folder already watched; an Edit's or a Write's, in any folder.
-async function beforeChange($: EngineInterface, paths: readonly string[], isShell: boolean, waitMs: number): Promise<boolean> {
+async function beforeChange(
+  $: EngineInterface,
+  paths: readonly string[],
+  isShell: boolean,
+  waitMs: number,
+): Promise<{ isRecorded: boolean; found: (Folder | null)[] }> {
   if (!hasGit) {
-    return true
+    return { isRecorded: true, found: [] }
   }
   const found = await Promise.all(paths.map(path => folderFor($, path, isShell).catch(() => null)))
   const waits = found.flatMap(one => (one?.state === 'watched' && !one.hasBase ? [one.ready] : []))
   if (waits.length > 0 && waitMs > 0) {
     await Promise.race([Promise.all(waits), $.clock.sleep(waitMs)])
   }
-  return found.every(one => one?.state !== 'watched' || one.hasBase)
+  return { isRecorded: found.every(one => one?.state !== 'watched' || one.hasBase), found }
 }
 
 // Whether a file is in a folder difnote has a record of: there, the
@@ -616,8 +1125,11 @@ function isWatched(path: string): boolean {
 }
 
 // Records each folder this session works in as it is now, and compares it
-// with its reviewed state.
-async function look($: EngineInterface): Promise<Looked> {
+// with its reviewed state. A look by itself (`isTimer`) keeps what the last
+// look found for each folder git says nothing changed in, and for each slow
+// one.
+async function look($: EngineInterface, isTimer: boolean): Promise<Looked> {
+  const was = looked
   // Looking at a folder finds the repositories inside it, which are looked
   // at in turn.
   const results: (Seen | null)[] = []
@@ -633,18 +1145,15 @@ async function look($: EngineInterface): Promise<Looked> {
     for (const one of watched) {
       done.add(one.folder)
     }
-    results.push(...(await Promise.all(watched.map(entry => lookAt($, entry)))))
+    results.push(...(await Promise.all(watched.map(entry => (isTimer ? keptOrLookAt($, entry, was) : lookAt($, entry))))))
   }
   // A folder a look was cut short in, as when Claude Code stopped the call
   // that started it, keeps what the last look found.
-  const was = looked
-  const now = await $.clock.now()
   const found: Looked = { trees: new Map(), files: new Map(), failed: [] }
   for (const result of results) {
     if (result !== null && 'tree' in result) {
       found.trees.set(result.folder, result.tree)
       found.files.set(result.folder, result.files)
-      times[result.folder] = { ...(times[result.folder] ?? { baseAt: now, tidiedAt: now }), usedAt: now }
     } else if (result !== null && result.isCut) {
       const tree = was?.trees.get(result.folder)
       if (tree !== undefined) {
@@ -653,6 +1162,18 @@ async function look($: EngineInterface): Promise<Looked> {
       }
     } else if (result !== null) {
       found.failed.push({ folder: result.folder, why: result.why })
+    }
+  }
+  // How many changed files each folder holds, for the 30-day emptying to say
+  // so. An outside folder with changes left to review, in it or a folder in
+  // it, is watched again by later sessions here, whoever changed it; one
+  // with nothing left is no longer.
+  for (const [folder, files] of found.files) {
+    const one = times[folder]
+    if (one !== undefined) {
+      const isClean = [...found.files].every(([other, list]) => !isInside(other, folder) || list.length === 0)
+      const from = !isOutside(folder) ? one.from : isClean ? one.from.filter(at => at !== cwd) : [...new Set([...one.from, cwd])].slice(-MOST_FROM)
+      times[folder] = { ...one, pending: files.length, from }
     }
   }
   await saveTimes($)
@@ -668,23 +1189,96 @@ function filesOfLook(found: Looked): FileDiff[] {
 
 type Seen = { folder: string; tree: string; files: FileDiff[] } | { folder: string; why: string; isCut: boolean }
 
+// A look by itself at one folder: what the last look found, for a slow
+// folder or one git says nothing changed in; else a look.
+async function keptOrLookAt($: EngineInterface, entry: Watched, was: Looked | null): Promise<Seen | null> {
+  const tree = was?.trees.get(entry.folder)
+  const files = was?.files.get(entry.folder)
+  if (tree !== undefined && files !== undefined && (isSlow(entry.folder) || (await isQuiet($, entry).catch(() => false)))) {
+    return { folder: entry.folder, tree, files }
+  }
+  return lookAt($, entry)
+}
+
 async function lookAt($: EngineInterface, entry: Watched): Promise<Seen | null> {
   if (!(await entry.ready)) {
     return null
   }
+  const startedAt = await $.clock.now()
   try {
-    const tree = await record($, entry, false)
+    const { tree, nested } = await record($, entry, false)
     ok(await inGit($, entry, 'refs', { stdin: `update refs/difnote/shown ${tree}\n` }), "git couldn't keep its state")
+    // Read before the comparison: a review elsewhere that moves it between
+    // the two makes the next look by itself look again.
+    const base = await refOf($, entry, 'base')
     const diff = ok(await inGit($, entry, 'diff'), "git couldn't compare it")
     const entries = entriesOf(diff.stdout, diff.isStdoutTruncated)
     const wanted = sizesWanted(entries)
     const sizes =
       wanted.length === 0 ? new Map<string, number>() : sizesOf((await inGit($, entry, 'sizes', { stdin: `${wanted.join('\n')}\n` })).stdout)
     const files = await Promise.all(entries.map(async one => fileOf(one, entry.folder, cwd, sizes, await changedAt($, entry.folder, one))))
+    quiet.set(entry.folder, { nested: nested.join('\0'), base, shown: tree })
+    // Slow looks count only one after another: a quick one, as after the
+    // folder's first big change, starts the count over.
+    if ((await $.clock.now()) - startedAt > SLOW_MS) {
+      slowness.set(entry.folder, (slowness.get(entry.folder) ?? 0) + 1)
+    } else {
+      slowness.delete(entry.folder)
+    }
     return { folder: entry.folder, tree, files }
   } catch (error) {
+    quiet.delete(entry.folder)
     return { folder: entry.folder, why: whyOf(error), isCut: isCut(error) }
   }
+}
+
+// Whether nothing changed in a folder since its last full look, by what git
+// reads without writing: no file it doesn't have, the same repositories in
+// it, the same reviewed state, and no file differing from the record but a
+// placeholder whose size and time are those recorded.
+async function isQuiet($: EngineInterface, entry: Watched): Promise<boolean> {
+  const known = quiet.get(entry.folder)
+  if (known === undefined) {
+    return false
+  }
+  const [others, dirty, base, shown] = await Promise.all([
+    inGit($, entry, 'others'),
+    inGit($, entry, 'dirty'),
+    refOf($, entry, 'base'),
+    refOf($, entry, 'shown'),
+  ])
+  if (others.exitCode !== 0 || dirty.exitCode !== 0 || others.isStdoutTruncated || dirty.isStdoutTruncated) {
+    return false
+  }
+  // A review, or another session's record, moved one of the states.
+  if (base !== known.base || shown !== known.shown) {
+    return false
+  }
+  // Any file new since the record lists beside the repositories in it.
+  if (splitZ(others.stdout).join('\0') !== known.nested) {
+    return false
+  }
+  const paths = splitZ(dirty.stdout)
+  if (paths.some(path => !placeholders.has(`${entry.folder}/${path}`))) {
+    return false
+  }
+  const facts = paths.length === 0 ? new Map() : await factsOf($, entry.folder, paths)
+  return paths.every(path => {
+    const fact = facts.get(path)
+    const recorded = placeholders.get(`${entry.folder}/${path}`)
+    return fact !== undefined && recorded !== undefined && recorded.size === fact.size && recorded.changedAt === fact.changedAt
+  })
+}
+
+// The id of a folder's reviewed or last recorded state, as git keeps it in
+// its files: read, not run.
+async function refOf($: EngineInterface, entry: Watched, name: 'base' | 'shown'): Promise<string> {
+  const loose = await $.fs.read(`${entry.git}/refs/difnote/${name}`).catch(() => null)
+  if (loose !== null) {
+    return loose.trim()
+  }
+  const packed = await $.fs.read(`${entry.git}/packed-refs`).catch(() => '')
+  return new RegExp(`^(\\S+) refs/difnote/${name}$`, 'm').exec(packed)?.[1] ?? ''
 }
 
 async function changedAt($: EngineInterface, folder: string, entry: Entry): Promise<number> {
@@ -696,7 +1290,7 @@ async function changedAt($: EngineInterface, folder: string, entry: Entry): Prom
 }
 
 // Marks each folder's state as the pane showed it reviewed: the next look
-// compares with it.
+// compares with it. A review uses the folder.
 async function reviewed($: EngineInterface, trees: ReadonlyMap<string, string>): Promise<string[]> {
   const now = await $.clock.now()
   const done = await Promise.all(
@@ -707,7 +1301,7 @@ async function reviewed($: EngineInterface, trees: ReadonlyMap<string, string>):
     }),
   )
   for (const folder of done.flat()) {
-    times[folder] = { ...(times[folder] ?? { usedAt: now, tidiedAt: now }), baseAt: now }
+    times[folder] = { ...timesFor(folder, now), baseAt: now, usedAt: now }
   }
   await saveTimes($)
   return done.flat()
@@ -861,44 +1455,48 @@ async function begin($: EngineInterface, entry: Watched): Promise<void> {
     }
   } else {
     await $.fs.write(`${store}/folder`, `${entry.folder}\n`)
-    ok(await git($, 'init', store, { env: envOf(entry.git, entry.folder) }), "git couldn't make a folder for it")
+    ok(await git($, 'init', OWN, { env: envOf(entry.git, entry.folder) }), "git couldn't make a folder for it")
   }
   await $.fs.write(`${entry.git}/config`, configOf(await $.fs.read(`${entry.git}/config`), entry.folder, excludesFile))
   const own = entry.kind === 'repository' ? await $.fs.read(`${entry.folder}/.git/info/exclude`).catch(() => '') : ''
   await $.fs.write(`${entry.git}/info/exclude`, excludeOf(entry.kind, own))
 
   if ((await inGit($, entry, 'base')).exitCode === 0) {
+    times[entry.folder] = { ...timesFor(entry.folder, await $.clock.now()), kind: entry.kind }
+    await saveTimes($)
     return
   }
   looking.add(entry.folder)
   changed($)
   try {
-    const tree = await record($, entry, true)
+    const { tree } = await record($, entry, true)
     ok(
       await inGit($, entry, 'refs', { stdin: `update refs/difnote/base ${tree}\nupdate refs/difnote/shown ${tree}\n` }),
       "git couldn't keep its state",
     )
     const now = await $.clock.now()
-    times[entry.folder] = { baseAt: now, usedAt: now, tidiedAt: now }
+    times[entry.folder] = { ...timesFor(entry.folder, now), baseAt: now, usedAt: now, tidiedAt: now, kind: entry.kind }
     await saveTimes($)
   } finally {
     looking.delete(entry.folder)
   }
 }
 
-// Records the folder as it is now and answers the state's id. Files up to
-// MOST_KEPT are kept whole; larger ones, those named like secrets and those
-// git can't read, by a placeholder with their size and time. Repositories
-// inside it are watched on their own.
-async function record($: EngineInterface, entry: Watched, isFirst: boolean): Promise<string> {
+// Records the folder as it is now and answers the state's id, and the
+// repositories git lists in it. Files up to MOST_KEPT are kept whole;
+// larger ones, those named like secrets and those git can't read, by a
+// placeholder with their size and time. Repositories inside it are watched
+// on their own.
+async function record($: EngineInterface, entry: Watched, isFirst: boolean): Promise<{ tree: string; nested: string[] }> {
   const others = ok(await inGit($, entry, 'others'), "git couldn't list its files")
   const listing = splitZ(others.stdout)
   const untracked = listing.filter(path => !path.endsWith('/'))
   if (others.isStdoutTruncated || untracked.length > MOST_FILES) {
     throw new Skip(`over ${MOST_FILES.toLocaleString('en-US')} files`)
   }
-  for (const nested of listing.filter(path => path.endsWith('/')).slice(0, MOST_NESTED)) {
-    follow($, `${entry.folder}/${nested.slice(0, -1)}`, 'repository')
+  const nested = listing.filter(path => path.endsWith('/'))
+  for (const one of nested.slice(0, MOST_NESTED)) {
+    follow($, `${entry.folder}/${one.slice(0, -1)}`, 'repository')
   }
 
   const dirty = isFirst ? [] : splitZ(ok(await inGit($, entry, 'dirty'), "git couldn't compare its files").stdout)
@@ -909,13 +1507,18 @@ async function record($: EngineInterface, entry: Watched, isFirst: boolean): Pro
   const facts = await factsOf($, entry.folder, paths)
   let add: string[] = []
   const drop: string[] = []
-  const marks: { path: string; text: string }[] = []
+  const marks: Mark[] = []
   for (const path of paths) {
     const fact = facts.get(path)
     if (fact?.kind === 'dir') {
       drop.push(path)
     } else if (fact !== undefined && (isSecret(path) || fact.size > MOST_KEPT)) {
-      marks.push({ path, text: placeholderOf(isSecret(path) ? 'secret' : 'large', fact.size, fact.changedAt) })
+      marks.push({
+        path,
+        size: fact.size,
+        changedAt: fact.changedAt,
+        text: placeholderOf(isSecret(path) ? 'secret' : 'large', fact.size, fact.changedAt),
+      })
     } else {
       add.push(path)
     }
@@ -933,7 +1536,9 @@ async function record($: EngineInterface, entry: Watched, isFirst: boolean): Pro
       throw new Skip(`git couldn't record it: ${firstLine(ran.stderr)}`)
     }
     add = add.filter(one => one !== path)
-    marks.push({ path, text: placeholderOf('unreadable', facts.get(path)?.size ?? 0, facts.get(path)?.changedAt ?? 0) })
+    const size = facts.get(path)?.size ?? 0
+    const time = facts.get(path)?.changedAt ?? 0
+    marks.push({ path, size, changedAt: time, text: placeholderOf('unreadable', size, time) })
   }
   if (drop.length > 0) {
     ok(await inGit($, entry, 'drop', { stdin: zOf(drop) }), "git couldn't record it")
@@ -942,7 +1547,7 @@ async function record($: EngineInterface, entry: Watched, isFirst: boolean): Pro
     await mark($, entry, marks)
   }
 
-  return ok(await inGit($, entry, 'tree'), "git couldn't record it").stdout.trim()
+  return { tree: ok(await inGit($, entry, 'tree'), "git couldn't record it").stdout.trim(), nested }
 }
 
 // The files a repository tracks though its .gitignore, or the person's own
@@ -956,13 +1561,19 @@ async function trackedOf($: EngineInterface, top: string): Promise<string[]> {
   return ran?.exitCode === 0 ? splitZ(ran.stdout) : []
 }
 
+// A file kept by a placeholder: its path, the size and time it was
+// recorded with, and the placeholder's text.
+type Mark = { path: string; size: number; changedAt: number; text: string }
+
 // Puts the placeholders into the record, each made into a git object once.
-async function mark($: EngineInterface, entry: Watched, marks: readonly { path: string; text: string }[]) {
+async function mark($: EngineInterface, entry: Watched, marks: readonly Mark[]) {
   const fresh = marks.filter(one => placeholders.get(`${entry.folder}/${one.path}`)?.text !== one.text)
   if (fresh.length > 0) {
     const ran = ok(await inGit($, entry, 'blobs', { stdin: blobsOf(fresh.map(one => one.text)) }), "git couldn't record it")
     const ids = ran.stdout.trim().split('\n')
-    fresh.forEach((one, i) => placeholders.set(`${entry.folder}/${one.path}`, { text: one.text, id: ids[i] ?? '' }))
+    fresh.forEach((one, i) =>
+      placeholders.set(`${entry.folder}/${one.path}`, { text: one.text, id: ids[i] ?? '', size: one.size, changedAt: one.changedAt }),
+    )
   }
   const lines = marks.map(one => `100644 ${placeholders.get(`${entry.folder}/${one.path}`)?.id ?? ''}\t${one.path}\0`)
   ok(await inGit($, entry, 'set', { stdin: lines.join('') }), "git couldn't record it")
@@ -1001,17 +1612,21 @@ async function factsOf($: EngineInterface, folder: string, paths: readonly strin
 }
 
 // A folder unused for 30 days is emptied: its states let go of, and its
-// record. git packs what's left at the next tidying.
+// record. git packs what's left at the next tidying. One whose last look
+// found changes not reviewed is named, for the session to say so.
 async function letGo($: EngineInterface): Promise<void> {
   const now = await $.clock.now()
   for (const [folder, one] of Object.entries(times)) {
     const store = gitOf(folder)
     if (now - one.usedAt > UNUSED_MS) {
       const env = envOf(store, folder)
-      await git($, 'refs', store, { stdin: 'delete refs/difnote/base\ndelete refs/difnote/shown\n', env }).catch(() => undefined)
-      await git($, 'empty', store, { env }).catch(() => undefined)
+      await git($, 'refs', OWN, { stdin: 'delete refs/difnote/base\ndelete refs/difnote/shown\n', env }).catch(() => undefined)
+      await git($, 'empty', OWN, { env }).catch(() => undefined)
       delete times[folder]
       emptied.add(folder)
+      if (one.pending > 0) {
+        lost = [...lost, folder]
+      }
     }
   }
   await saveTimes($)
@@ -1027,12 +1642,12 @@ async function tidy($: EngineInterface): Promise<void> {
     // now is tidied next time.
     if (!(await $.fs.exists(`${store}/HEAD`))) {
       delete times[folder]
-    } else if ((await git($, 'gc', store, { timeoutMs: 300_000, env: envOf(store, folder) }).catch(() => null))?.exitCode === 0) {
+    } else if ((await git($, 'gc', OWN, { timeoutMs: 300_000, env: envOf(store, folder) }).catch(() => null))?.exitCode === 0) {
       one.tidiedAt = now
     }
   }
   for (const folder of emptied) {
-    await git($, 'gc', gitOf(folder), { timeoutMs: 300_000, env: envOf(gitOf(folder), folder) }).catch(() => undefined)
+    await git($, 'gc', OWN, { timeoutMs: 300_000, env: envOf(gitOf(folder), folder) }).catch(() => undefined)
   }
   emptied.clear()
   await saveTimes($)
@@ -1045,6 +1660,12 @@ async function saveTimes($: EngineInterface) {
 // How a command runs: what goes on its standard input, how long it may
 // take, and, for a private git folder's, git's variables naming it.
 type Init = { stdin?: string; timeoutMs?: number; env?: Record<string, string> }
+
+// Where difnote's commands on its private git folders run: never inside a
+// folder it watches, where git would read paths, and a ref's name, as that
+// folder's files; as when the private folder itself lies in one, with
+// difnote loaded from its own repository.
+const OWN = '/'
 
 type Command =
   | 'version'
@@ -1066,12 +1687,12 @@ type Command =
   | 'empty'
   | 'gc'
 
-// Every git command difnote runs, each written out in full. They run in a
-// private git folder (`--git-dir=.`), but `version` and `excludes`, which
-// run in the session's folder, `top`, in the folder asked about, and
-// `init`, in the folder that will hold the private one. What differs from
-// call to call, paths and ids, goes on standard input. The README says when
-// and why each runs.
+// Every git command difnote runs, each written out in full, in `folder`:
+// `version` and `excludes` in the session's folder, `tracked` in the
+// repository it reads, and the rest, which work on a private git folder
+// that git's own variables name (envOf), in OWN. What differs from call to
+// call, paths and ids, goes on standard input. The README says when and why
+// each runs.
 function git($: EngineInterface, command: Command, folder: string, init: Init = {}): Promise<RunResult> {
   const options = {
     cwd: folder,
@@ -1086,20 +1707,19 @@ function git($: EngineInterface, command: Command, folder: string, init: Init = 
     excludes: () => $.process.run(['git', 'config', '--global', '--path', '--get', 'core.excludesFile'], { cwd: folder, timeoutMs: 5_000 }),
     init: () => $.process.run(['git', 'init', '--quiet'], options),
     tracked: () => $.process.run(['git', '--no-optional-locks', 'ls-files', '-z', '--cached', '--ignored', '--exclude-standard'], options),
-    others: () => $.process.run(['git', '--git-dir=.', 'ls-files', '-z', '--others', '--exclude-standard'], options),
-    dirty: () => $.process.run(['git', '--git-dir=.', 'diff-files', '-z', '--name-only'], options),
-    add: () => $.process.run(['git', '--git-dir=.', 'update-index', '-z', '--add', '--remove', '--stdin'], options),
-    drop: () => $.process.run(['git', '--git-dir=.', 'update-index', '-z', '--force-remove', '--stdin'], options),
-    set: () => $.process.run(['git', '--git-dir=.', 'update-index', '-z', '--index-info'], options),
-    blobs: () => $.process.run(['git', '--git-dir=.', 'fast-import', '--quiet', '--done'], options),
-    tree: () => $.process.run(['git', '--git-dir=.', 'write-tree'], options),
-    refs: () => $.process.run(['git', '--git-dir=.', 'update-ref', '--stdin'], options),
-    base: () => $.process.run(['git', '--git-dir=.', 'rev-parse', '--verify', '--quiet', 'refs/difnote/base'], options),
+    others: () => $.process.run(['git', 'ls-files', '-z', '--others', '--exclude-standard'], options),
+    dirty: () => $.process.run(['git', 'diff-files', '-z', '--name-only'], options),
+    add: () => $.process.run(['git', 'update-index', '-z', '--add', '--remove', '--stdin'], options),
+    drop: () => $.process.run(['git', 'update-index', '-z', '--force-remove', '--stdin'], options),
+    set: () => $.process.run(['git', 'update-index', '-z', '--index-info'], options),
+    blobs: () => $.process.run(['git', 'fast-import', '--quiet', '--done'], options),
+    tree: () => $.process.run(['git', 'write-tree'], options),
+    refs: () => $.process.run(['git', 'update-ref', '--stdin'], options),
+    base: () => $.process.run(['git', 'rev-parse', '--verify', '--quiet', 'refs/difnote/base'], options),
     diff: () =>
       $.process.run(
         [
           'git',
-          '--git-dir=.',
           'diff-tree',
           '-r',
           '-z',
@@ -1110,13 +1730,14 @@ function git($: EngineInterface, command: Command, folder: string, init: Init = 
           '-U3',
           'refs/difnote/base',
           'refs/difnote/shown',
+          '--',
         ],
         options,
       ),
-    sizes: () => $.process.run(['git', '--git-dir=.', 'cat-file', '--batch-check'], options),
-    ignored: () => $.process.run(['git', '--git-dir=.', 'check-ignore', '-z', '--stdin'], options),
-    empty: () => $.process.run(['git', '--git-dir=.', 'read-tree', '--empty'], options),
-    gc: () => $.process.run(['git', '--git-dir=.', 'gc', '--quiet', '--prune=1.hour.ago'], options),
+    sizes: () => $.process.run(['git', 'cat-file', '--batch-check'], options),
+    ignored: () => $.process.run(['git', 'check-ignore', '-z', '--stdin'], options),
+    empty: () => $.process.run(['git', 'read-tree', '--empty'], options),
+    gc: () => $.process.run(['git', 'gc', '--quiet', '--prune=1.hour.ago'], options),
   } satisfies Record<Command, () => Promise<RunResult>>
   return commands[command]()
 }
@@ -1128,7 +1749,7 @@ const LOCK_MS = 300
 
 async function inGit($: EngineInterface, entry: Watched, command: Command, init: Omit<Init, 'env'> = {}): Promise<RunResult> {
   for (let tries = 0; ; tries += 1) {
-    const ran = await git($, command, entry.git, { ...init, env: envOf(entry.git, entry.folder) })
+    const ran = await git($, command, OWN, { ...init, env: envOf(entry.git, entry.folder) })
     if (ran.exitCode === 0 || !ran.stderr.includes('.lock') || tries >= LOCK_TRIES) {
       return ran
     }
@@ -1163,6 +1784,7 @@ export const register: Register = (on, options) => {
     removed: colorOf(options.removedColor, 'error'),
     note: colorOf(options.noteColor, 'suggestion'),
     quiet: colorOf(options.quietColor, 'inactive'),
+    cursor: colorOf(options.cursorColor, 'claude'),
   }
   const hasIcons = options.fileIcons !== false
 
@@ -1175,13 +1797,19 @@ export const register: Register = (on, options) => {
     await update($, watch, () => watchOf())
     await readChanges($)
     await readNotes($)
-    // A pane Claude Code shows again after a restart looks at once.
+    await readViewed($)
+    // A pane Claude Code kept open through a restart, shown or behind
+    // another tab, looks by itself; shown, it looks at once.
+    setOpen(
+      $,
+      (await $.ui.panes().catch(() => [])).some(one => one.id === PANE),
+    )
     if (await isShown($)) {
       void refresh($).catch(() => undefined)
     }
     await $.command.register({
       name: NAME,
-      description: 'Open or close difnote: review what changed since you last looked, and write notes for the prompt',
+      description: 'Open difnote, or go back into it: review what changed since you last looked, and write notes for the prompt',
     })
 
     return next(e)
@@ -1192,12 +1820,13 @@ export const register: Register = (on, options) => {
     shownTrees = new Map()
     await readChanges($).catch(() => undefined)
     await readNotes($).catch(() => undefined)
+    await readViewed($).catch(() => undefined)
 
     return next(e)
   })
 
   on('command.run', { command: NAME }, async $ => {
-    await togglePane($).catch(() => undefined)
+    await showPane($).catch(() => undefined)
 
     return {}
   })
@@ -1208,7 +1837,8 @@ export const register: Register = (on, options) => {
   // may have changed files all the same.
   on('tool.call', async ($, e, next) => {
     const { paths, isShell } = namedBy(e)
-    const isRecorded = paths.length === 0 || (await beforeChange($, paths, isShell, WAIT_MS).catch(() => true))
+    const before = paths.length === 0 ? null : await beforeChange($, paths, isShell, WAIT_MS).catch(() => null)
+    const isRecorded = before?.isRecorded ?? true
     // A folder recorded only after Claude's change has it in its record:
     // Claude's own record of the change shows instead.
     if (!isRecorded && !isShell) {
@@ -1221,11 +1851,23 @@ export const register: Register = (on, options) => {
     learnTitle(e.tool, ran.result)
     const change = ran.isError === true ? null : (changeOf(e.tool_use_id, e.tool, ran.result) ?? docOf(e.tool_use_id, e.tool, e, ran.result, titles))
     if (change !== null) {
+      const hadFiles = (await filesNow($).catch(() => [])).length > 0
       await update($, changes, list => (list.some(one => one.id === change.id) ? list : kept([...list, change]))).catch(() => undefined)
+      await parkWhenListed($, hadFiles).catch(() => undefined)
+    }
+    // The folders Claude changed: an Edit's or a Write's, and those of the
+    // files Claude Code says a shell command changed. A command that only
+    // names a folder, as `ls` or `cd` does, changes none.
+    if (!isShell && ran.isError !== true && before !== null) {
+      await touched($, before.found).catch(() => undefined)
     }
     const found = isShell ? changedBy(ran.result) : []
     if (found.length > 0) {
-      void beforeChange($, found, true, 0).catch(() => undefined)
+      // No wait for a folder new to difnote: its first record goes on in the
+      // background.
+      await beforeChange($, found, true, 0)
+        .then(after => touched($, after.found))
+        .catch(() => undefined)
     }
     if ((isShell || paths.length > 0) && (await isShown($))) {
       void refresh($).catch(() => undefined)
@@ -1234,24 +1876,10 @@ export const register: Register = (on, options) => {
     return ran
   })
 
-  // A prompt the person sends Claude may end the review (see promptSent).
-  on('prompt.submit', async ($, e, next) => {
-    const entered = await next(e)
-    if (entered.drop === undefined && e.origin.kind === 'composer' && !e.text.trimStart().startsWith('/')) {
-      await promptSent($).catch(() => undefined)
-    }
-
-    return entered
-  })
-
-  // The ring is followed, for c, j and k; moving it off the note field, to
-  // another row, closes the field.
+  // The person moving the ring off the note field closes it.
   on('ui.focus', async ($, e, next) => {
-    if (e.requestId === PANE && e.element !== undefined && e.element !== FIELD && !e.element.startsWith('key-') && e.element !== 'send') {
-      ring = e.element
-    }
     if (e.requestId === PANE && e.origin.kind === 'person' && e.element !== FIELD) {
-      await update($, editing, () => null).catch(() => undefined)
+      await closeField($).catch(() => undefined)
     }
     // A key in a pane last looked a while ago, as one back from behind
     // another, looks again.
@@ -1272,31 +1900,39 @@ export const register: Register = (on, options) => {
     }
     const answered = await next(e)
     if (e.id === PANE && answered.deny === undefined) {
+      setOpen($, false)
       await forget($).catch(() => undefined)
     }
 
     return answered
   })
 
+  // difnote scrolls its own window: the person's scrolls move its cursor
+  // and window, and the engine's window stays at the top.
+  on('ui.scroll', { requestId: PANE }, async ($, e, next) => {
+    if (e.origin.kind !== 'person' || layout === null) {
+      return next(e)
+    }
+    await scrolled($, e.by, e.pointer !== undefined, e.contentRows).catch(() => undefined)
+    return {}
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const ui = $.ui.resolve(e)
     const list = await read($, changes)
     const files = listedFiles(await read($, diffs), list)
-    const rows = rowsOf(files)
-    const open = await read($, file)
-    const shown = files.some(one => one.path === open) ? open : null
-    const hunk = await read($, picking)
+    const rows = rowsOfFiles(files)
     const watching = await read($, watch)
-    walk = walkOf({ files, rows, file: shown, picking: hunk })
     shownUpTo = list.at(-1)?.id ?? shownUpTo
     // A look of its own would be cut short by the next drawing: the pane
     // looks when it opens, after each change while shown, and on a key.
     shownTrees = looked?.trees ?? shownTrees
-
-    return paneOf({
+    const view: PaneView = {
       ui,
       Input: 'Input' in ui ? ui.Input : undefined,
       columns: e.props.bodyColumns,
+      height: e.props.scroll.bodyRows,
+      isFocused: e.props.isFocused,
       colors,
       hasIcons,
       files,
@@ -1304,19 +1940,18 @@ export const register: Register = (on, options) => {
       watch: watching,
       isLooking: isLooking || watching.looking.length > 0,
       now: await $.clock.now(),
-      file: shown,
-      picking: hunk,
       notes: await read($, notes),
       editing: await read($, editing),
-      open: path => void openFile($, path).catch(() => undefined),
-      back: () => void goBack($).catch(() => undefined),
-      pick: key => void togglePicking($, key).catch(() => undefined),
-      write: row => void openField($, row).catch(() => undefined),
-      save: (row, text) => void saveNote($, row, text).catch(() => undefined),
-      move: step => void moveRing($, step).catch(() => undefined),
-      note: () => void noteHere($).catch(() => undefined),
-      send: () => void sendNotes($, rows).catch(() => undefined),
-      reviewed: () => void markReviewed($).catch(() => undefined),
-    })
+      place: await read($, place),
+      viewed: await read($, viewed),
+    }
+    layout = layoutOf(view)
+    // difnote's window starts at the top of the tree; the engine's moved off
+    // it (as when the element the ring was on goes) is put back.
+    if (e.props.scroll.offset > 0) {
+      void $.ui.scroll({ to: 'start', in: PANE }).catch(() => undefined)
+    }
+
+    return paneOf(view, layout, actionsOf($, rows))
   })
 }

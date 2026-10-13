@@ -4,6 +4,29 @@ Notable changes to difnote. The format follows [Keep a Changelog](https://keepac
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-14
+
+### Added
+
+- `v` marks a file viewed, as on GitHub: its row goes quiet with a ✓, and the mark drops once the file changes again, so what Claude changes after your notes shows again.
+- `r` asks before it marks everything reviewed, as a review can't be undone.
+- The pane names the folders it watches again from earlier sessions here, and `x` on one stops watching it from here, leaving its changes unreviewed.
+- When a folder unused for 30 days is emptied with changes you hadn't reviewed, the session says so, in a message and in the pane.
+
+### Changed
+
+- The pane is one list: Enter opens a file's hunks right under its row, and `h` or Esc closes it again, the cursor back on its row; there is no separate file view and no line picking. difnote draws its own cursor, a bar beside its row, that moves over files, folder headings, hunk headers and changed lines with `j`/`k` or the arrows. The summary stays at the top and the keys at the bottom, however long the file; the first key says what Enter does. Files are grouped under their folders, by name. Long lines wrap, and `w` cuts them to one row but the cursor's. `n` opens the next file. A new Cursor color option.
+- `/difnote` no longer closes the pane. With the pane open, behind another tab or with the keyboard in the prompt box, it gives the pane the keyboard again, where you left it, a note you were writing too; Esc closes it.
+- A review ends only when you choose, with `r`. Sending your notes and your other prompts leave the list as it is, so you can go on reviewing while Claude works; before, any prompt you sent after the pane showed the changes marked them reviewed.
+
+### Fixed
+
+- Going back from a file put the cursor on the wrong file.
+- Where a note or the cursor splits a hunk that reaches line 10, 100 or 1,000, its line numbers no longer shift a column between the parts.
+- difnote runs its commands on its private git folders from `/`. Run from that folder, git read a path, and the name of a reviewed state, as files of the folder being watched when the private git folder lay inside it, as it does with difnote loaded from its own repository: that folder failed with "ambiguous argument 'refs/difnote/base'".
+- An open pane looks again by itself 10 seconds after its last look, so changes no hook sees, yours, a script's or another session's, show without reopening it; before, a pane with nothing in it never looked again. A look by itself first asks git whether anything is new, with two commands that only read, and records only the folders where something is; it waits longer after a slow look, leaves a folder whose look took over 3 seconds twice to the other looks, pauses while you write a note, and stops while the pane is closed or behind another tab.
+- A later session in the same folder watches again the folders outside it that Claude changed in earlier sessions there, such as a repository Claude changed with `cd`, while their changes wait for review; before, they showed only in the session that made them. A look no longer counts as using a folder for the 30-day emptying: Claude changing it, a review or a session starting in it does.
+
 ## [0.1.0] - 2026-10-13
 
 ### Added
@@ -19,5 +42,6 @@ Notable changes to difnote. The format follows [Keep a Changelog](https://keepac
 - A review ends when you send Claude your own prompt after the pane showed it, unless notes are waiting, or when you press `r`. What the pane showed counts as reviewed, across sessions.
 - Options: File icons, and colors for added and removed counts, notes and quiet text.
 
-[Unreleased]: https://github.com/mmedum/difnote/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/mmedum/difnote/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/mmedum/difnote/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mmedum/difnote/releases/tag/v0.1.0

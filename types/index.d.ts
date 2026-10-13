@@ -68,13 +68,29 @@ export type Bare = { why: 'binary' | 'large' | 'secret' | 'unreadable' | 'cut'; 
 // What difnote watches: whether git runs here (without it, only Claude's
 // Edit and Write show); when the oldest state the pane compares against was
 // recorded, null before any; the folders being recorded for the first time;
-// and the folders it doesn't watch, with why.
+// the folders it doesn't watch, with why; the folders it looks at only
+// after Claude's changes or a key, as looking at them is slow; the folders
+// outside the session's that earlier sessions here left changes in, with
+// when one last used them; the folders emptied at the session's start
+// that still held changes not reviewed; the folders the list groups files
+// under, the session's first; and the home folder, written ~ in them.
 export type Watch = {
   hasGit: boolean
   since: number | null
   looking: string[]
   skipped: { folder: string; why: string }[]
+  slow: string[]
+  carried: { folder: string; usedAt: number }[]
+  lost: string[]
+  roots: string[]
+  home: string | null
 }
+
+// Where the person is in the pane's list: the file open under its row
+// (null for none), the row the cursor is on, by its key, the first row the
+// window shows as asked, whether lines other than the cursor's are cut to
+// one row, and the folders whose files are folded away.
+export type Place = { open: string | null; cursor: string | null; top: number; isCompact: boolean; closed: string[] }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -91,11 +107,14 @@ declare module 'claude-code' {
       notes: Note[]
       // The row whose note field is open; null while none is.
       editing: string | null
-      // The file the pane has open, by path; null for the list of files.
-      file: string | null
-      // The hunk whose lines are drawn one to a row to pick one, by its
-      // row's key; null while each hunk is drawn as highlighted code.
-      picking: string | null
+      // Where the person is in the list: the file open under its row, the
+      // row the cursor is on, the window's first row, whether lines are cut,
+      // and the folders closed.
+      place: Place
+      // The files the person marked viewed, by path, each with the
+      // fingerprint of its change when marked: a file is viewed while its
+      // change is still that one.
+      viewed: Record<string, string>
     }
   }
 }

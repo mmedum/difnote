@@ -1,26 +1,33 @@
 import { describe, expect, test } from 'claude-code/testing'
-import { changeOf } from '../hooks/review'
+import { changeOf, filesOf, fingerprintOf } from '../hooks/review'
 import {
   CLOSER,
   CWD,
   DOC_TITLE,
-  buttonsOf,
   closeMark,
   codeOf,
   command,
+  cursorOf,
   docTool,
   edit,
   fieldUnder,
+  goTo,
+  listOf,
   mount,
   moveTo,
+  openFile,
   send,
+  shownOf,
   started,
   textsOf,
+  padsOf,
+  wrapsOf,
   write,
 } from './kit'
 import type { Mounted } from './kit'
 
 const A = `${CWD}/a.ts`
+const B = `${CWD}/b.ts`
 const FIVE = 'one\ntwo\nthree\nfour\nfive\n'
 
 // The keys of a.ts's rows after Claude changed "two" to "TWO": a changed
@@ -46,14 +53,14 @@ async function note(ui: Mounted, text: string) {
 }
 
 describe('the list', () => {
-  test('lists the files Claude changed since the start, the one changed last first, with what each adds and removes', async ($, on) => {
+  test('lists the files Claude changed since the start by name, with what each adds and removes', async ($, on) => {
     await started($, on, { files: { [A]: FIVE } })
-    await edit($, 't1', 'a.ts', 'two', 'TWO')
-    await write($, 't2', 'b.ts', 'hello\n')
+    await write($, 't1', 'b.ts', 'hello\n')
+    await edit($, 't2', 'a.ts', 'two', 'TWO')
     const ui = await mount($)
 
     expect((await textsOf(ui))[0]).toBe('since your last review · 2 files +2 −1')
-    expect(await buttonsOf(ui, 'file:')).toEqual([`${TS}b.ts new`, `${TS}a.ts +1 −1`])
+    expect(await listOf(ui)).toEqual([`${TS}a.ts +1 −1`, `${TS}b.ts new`])
   })
 
   test("lists a subagent's change too", async ($, on) => {
@@ -61,14 +68,17 @@ describe('the list', () => {
     await edit($, 't1', 'a.ts', 'two', 'TWO', 'agent-1')
     const ui = await mount($)
 
-    expect(await buttonsOf(ui, 'file:')).toEqual([`${TS}a.ts +1 −1`])
+    expect(await listOf(ui)).toEqual([`${TS}a.ts +1 −1`])
   })
 
   test("without git, says it sees only Claude's Edit and Write, and that there is nothing", async ($, on) => {
     await started($, on, { files: { [A]: FIVE } })
     const ui = await mount($)
 
-    expect(await textsOf(ui)).toEqual(['No changes from Claude since your last review.', "Without git, difnote sees only Claude's Edit and Write."])
+    expect((await textsOf(ui)).slice(0, 2)).toEqual([
+      'No changes from Claude since your last review.',
+      " Without git, difnote sees only Claude's Edit and Write.",
+    ])
   })
 
   test('leaves out a change held for review, which left the file as it was, and any other tool', () => {
@@ -96,30 +106,111 @@ describe('the list', () => {
     await edit($, 't1', 'a.ts', 'two', 'TWO')
     const ui = await mount($)
 
-    expect(await buttonsOf(ui, 'file:')).toEqual(['a.ts +1 −1'])
+    expect(await listOf(ui)).toEqual(['a.ts +1 −1'])
   })
 
-  test('writes a path outside the session folder in full', async ($, on) => {
+  test('lists files under a heading of their folder, folders first and by path, and one outside the session folder under its own', async ($, on) => {
     await started($, on)
-    await write($, 't1', '/etc/demo.conf', 'x = 1\n')
+    await write($, 't1', 'src/z.ts', 'z\n')
+    await write($, 't2', 'a.ts', 'a\n')
+    await write($, 't3', 'lib/b.ts', 'b\n')
+    await write($, 't4', '/etc/demo.conf', 'x = 1\n')
     const ui = await mount($)
 
-    expect(await buttonsOf(ui, 'file:')).toEqual([`${CONF}/etc/demo.conf new`])
+    expect(await listOf(ui)).toEqual([
+      '~/app · 3 files',
+      'lib/ · 1 file',
+      `  ${TS}b.ts new`,
+      'src/ · 1 file',
+      `  ${TS}z.ts new`,
+      `${TS}a.ts new`,
+      '/etc · 1 file',
+      `${CONF}demo.conf new`,
+    ])
+  })
+
+  test("Enter on a folder's heading folds its files away, and again unfolds them, the cursor on the heading", async ($, on) => {
+    await started($, on)
+    await write($, 't1', 'src/z.ts', 'z\n')
+    await write($, 't2', 'a.ts', 'a\n')
+    const ui = await mount($)
+    await goTo(ui, `dir:${CWD}|src`)
+
+    await ui.press({ key: 'enter' })
+    expect(await listOf(ui)).toEqual(['▸ src/ · 1 file', `${TS}a.ts new`])
+    expect(await cursorOf(ui)).toBe(`dir:${CWD}|src`)
+    await ui.press({ key: 'enter' })
+    expect(await listOf(ui)).toEqual(['src/ · 1 file', `  ${TS}z.ts new`, `${TS}a.ts new`])
+  })
+
+  test('h on a file goes to its folder heading, and again folds it; l unfolds it', async ($, on) => {
+    await started($, on)
+    await write($, 't1', 'src/z.ts', 'z\n')
+    const ui = await mount($)
+    await goTo(ui, `file:${CWD}/src/z.ts`)
+
+    await ui.press({ key: 'key-out' })
+    expect(await cursorOf(ui)).toBe(`dir:${CWD}|src`)
+    await ui.press({ key: 'key-out' })
+    expect(await listOf(ui)).toEqual(['▸ src/ · 1 file'])
+    await ui.press({ key: 'key-in' })
+    expect(await listOf(ui)).toEqual(['src/ · 1 file', `  ${TS}z.ts new`])
   })
 })
 
-describe('a file', () => {
-  test("Enter opens a file: each hunk under its header, as Claude Code's highlighted diff of that file, then the next file", async ($, on) => {
+describe('a file opened in place', () => {
+  test("Enter opens a file under its row: each hunk under its header, as Claude Code's highlighted diff, the cursor on its first changed line", async ($, on) => {
     await started($, on, { files: { [A]: FIVE } })
     await write($, 't1', 'b.ts', 'hello\n')
     await edit($, 't2', 'a.ts', 'two', 'TWO')
     const ui = await mount($)
 
-    await ui.press({ key: FILE })
-    expect((await ui.find({ key: FILE }))?.text).toBe(`${TS}a.ts +1 −1 · 1/2`)
-    expect(await textsOf(ui)).toContain('line 2 · +1 −1')
+    await openFile(ui, A)
+    expect(await listOf(ui)).toEqual([`▾ ${TS}a.ts +1 −1 · 1/2`, `${TS}b.ts new`])
+    expect(await shownOf(ui)).toContain('line 2 · +1 −1')
+    expect(await cursorOf(ui)).toBe(REMOVED)
+    await ui.press({ key: 'key-up' })
+    expect(await cursorOf(ui)).toBe(HUNK)
     expect(await codeOf(ui)).toEqual([{ path: A, source: TWO_HUNK }])
-    expect((await ui.find({ key: 'next' }))?.text).toBe('next: b.ts')
+  })
+
+  test("the cursor's line is a piece of code of its own, beside the cursor's bar", async ($, on) => {
+    await started($, on, { files: { [A]: FIVE } })
+    await edit($, 't1', 'a.ts', 'two', 'TWO')
+    const ui = await mount($)
+
+    await openFile(ui, A)
+    await goTo(ui, ADDED)
+    expect(await codeOf(ui)).toEqual([
+      { path: A, source: '@@ -1,2 +1,1 @@\n one\n-two' },
+      { path: A, source: '@@ -2,0 +2,1 @@\n+TWO' },
+      { path: A, source: '@@ -3,3 +3,3 @@\n three\n four\n five' },
+    ])
+  })
+
+  test('pieces of a hunk crossing line 10 line up with its two-digit gutter', async ($, on) => {
+    await started($, on, { files: { [A]: 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\n' } })
+    await edit($, 't1', 'a.ts', 'l7', 'L7')
+    const ui = await mount($)
+
+    await openFile(ui, A)
+    await goTo(ui, `line:${A}:0:+L7`)
+    expect(await codeOf(ui)).toEqual([
+      { path: A, source: '@@ -4,4 +4,3 @@\n l4\n l5\n l6\n-l7' },
+      { path: A, source: '@@ -7,0 +7,1 @@\n+L7' },
+      { path: A, source: '@@ -8,3 +8,3 @@\n l8\n l9\n l10' },
+    ])
+    expect(await padsOf(ui)).toEqual([1, 1, 0])
+  })
+
+  test('a hunk ending on line 9 keeps a one-digit gutter, as Claude Code draws it', async ($, on) => {
+    await started($, on, { files: { [A]: 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n' } })
+    await edit($, 't1', 'a.ts', 'l7', 'L7')
+    const ui = await mount($)
+
+    await openFile(ui, A)
+    await goTo(ui, `line:${A}:0:+L7`)
+    expect(await padsOf(ui)).toEqual([0, 0, 0])
   })
 
   test('shows several changes to a file as one diff, from before the first to after the latest', async ($, on) => {
@@ -129,116 +220,162 @@ describe('a file', () => {
     await edit($, 't3', 'a.ts', 'five', 'five\nsix')
     const ui = await mount($)
 
-    await ui.press({ key: FILE })
+    await openFile(ui, A)
+    await ui.press({ key: 'key-up' })
     expect(await codeOf(ui)).toEqual([{ path: A, source: '@@ -1,5 +1,6 @@\n one\n-two\n+Two\n three\n four\n five\n+six' }])
   })
 
-  test('opens a file with the cursor on its first hunk; h goes back to the list, the cursor on the file it left', async ($, on) => {
+  test('h from inside the open file closes it, the cursor back on its row, and Enter on its row closes it too', async ($, on) => {
     await started($, on, { files: { [A]: FIVE } })
-    await edit($, 't1', 'a.ts', 'two', 'TWO')
+    await write($, 't1', 'b.ts', 'hello\n')
+    await edit($, 't2', 'a.ts', 'two', 'TWO')
     const ui = await mount($)
 
-    await ui.press({ key: FILE })
-    await ui.press({ key: 'key-note' })
-    expect(await fieldUnder(ui)).toBe(HUNK)
-    await ui.press({ key: 'back' })
-    expect(await buttonsOf(ui, 'file:')).toEqual([`${TS}a.ts +1 −1`])
-    await ui.press({ key: 'key-note' })
-    expect(await fieldUnder(ui)).toBe(FILE)
-  })
-
-  test('draws no hunk past 60,000 characters of code, and says how many it left out', async ($, on) => {
-    await started($, on)
-    await write($, 't1', 'big.ts', `${'x'.repeat(61_000)}\n`)
-    const ui = await mount($)
-
-    await ui.press({ key: `file:${CWD}/big.ts` })
+    await openFile(ui, A)
+    await ui.press({ key: 'key-out' })
+    expect(await cursorOf(ui)).toBe(FILE)
     expect(await codeOf(ui)).toEqual([])
-    expect(await textsOf(ui)).toContain('+1 more hunk, too large to draw')
+    await ui.press({ key: 'enter' })
+    await goTo(ui, FILE)
+    await ui.press({ key: 'enter' })
+    expect(await codeOf(ui)).toEqual([])
+    expect(await cursorOf(ui)).toBe(FILE)
   })
 
-  test('Enter on a hunk header puts a cursor column beside its code, which keeps its colors, the cursor on the first changed line; again, takes it away', async ($, on) => {
+  test('closing a file, from any place in the list, puts the cursor on the file it came from', async ($, on) => {
+    await started($, on)
+    await write($, 't1', 'a.ts', 'a\n')
+    await write($, 't2', 'b.ts', 'b\n')
+    await write($, 't3', 'c.ts', 'c\n')
+    const ui = await mount($)
+
+    for (const name of ['a.ts', 'b.ts', 'c.ts']) {
+      await openFile(ui, `${CWD}/${name}`)
+      await ui.press({ key: 'key-out' })
+      expect(await cursorOf(ui)).toBe(`file:${CWD}/${name}`)
+    }
+  })
+
+  test('opening a file closes the one open, and n opens the next, the last staying open', async ($, on) => {
+    await started($, on)
+    await write($, 't1', 'a.ts', 'a\n')
+    await write($, 't2', 'b.ts', 'b\n')
+    const ui = await mount($)
+
+    await openFile(ui, A)
+    await openFile(ui, B)
+    expect((await codeOf(ui)).map(code => code.path)).toEqual([B])
+    await openFile(ui, A)
+    await ui.press({ key: 'key-next' })
+    expect((await codeOf(ui)).map(code => code.path)).toEqual([B])
+    expect(await ui.find({ key: 'key-next' })).toBeUndefined()
+  })
+
+  test("when Claude changes the cursor's line, the cursor goes to the open file's row", async ($, on) => {
+    await started($, on, { files: { [A]: FIVE, [B]: FIVE } })
+    await edit($, 't1', 'a.ts', 'two', 'TWO')
+    await edit($, 't2', 'b.ts', 'two', 'TWO')
+    const ui = await mount($)
+    await openFile(ui, B)
+    await goTo(ui, `line:${B}:0:+TWO`)
+
+    await edit($, 't3', 'b.ts', 'TWO', 'Two')
+    expect(await cursorOf(ui)).toBe(`file:${B}`)
+  })
+
+  test("lines wrap, and w cuts every line to one row but the cursor's", async ($, on) => {
     await started($, on, { files: { [A]: FIVE } })
     await edit($, 't1', 'a.ts', 'two', 'TWO')
     const ui = await mount($)
-    await ui.press({ key: FILE })
+    await openFile(ui, A)
 
-    await ui.press({ key: HUNK })
-    expect(await buttonsOf(ui, 'line:')).toEqual(['›', '›'])
-    expect(await codeOf(ui)).toEqual([{ path: A, source: TWO_HUNK }])
-    await ui.press({ key: 'key-note' })
-    expect(await fieldUnder(ui)).toBe(REMOVED)
-    await ui.press({ key: HUNK })
-    expect(await buttonsOf(ui, 'line:')).toEqual([])
+    expect(await wrapsOf(ui)).toEqual(['wrap', 'wrap', 'wrap'])
+    await ui.press({ key: 'key-wrap' })
+    expect(await wrapsOf(ui)).toEqual(['truncate-end', 'wrap', 'truncate-end'])
   })
 
-  test("the cursor column reaches a hunk's first 300 lines", async ($, on) => {
+  test('cuts a line past twelve rows, marking the cut', async ($, on) => {
     await started($, on)
-    await write($, 't1', 'long.ts', Array.from({ length: 310 }, (_, i) => `line ${i + 1}`).join('\n'))
+    await write($, 't1', 'big.ts', `${'x'.repeat(2_000)}\n`)
     const ui = await mount($)
-    await ui.press({ key: `file:${CWD}/long.ts` })
 
-    await ui.press({ key: `hunk:${CWD}/long.ts:0:@+line 1` })
-    expect((await buttonsOf(ui, 'line:')).length).toBe(300)
+    await openFile(ui, `${CWD}/big.ts`)
+    const [code] = await codeOf(ui)
+    expect(String(code?.source).endsWith('…')).toBe(true)
+    expect(String(code?.source).length).toBeLessThan(800)
+  })
+
+  test('keeps the summary above and the keys below a long file, the cursor in view, and its row on top once scrolled past', async ($, on) => {
+    await started($, on)
+    await write($, 't1', 'long.ts', Array.from({ length: 60 }, (_, i) => `line ${i + 1}`).join('\n'))
+    const ui = await mount($, 60, 14)
+    await openFile(ui, `${CWD}/long.ts`)
+
+    for (let i = 0; i < 40; i += 1) {
+      await ui.press({ key: 'key-down' })
+    }
+    expect((await textsOf(ui))[0]).toBe('since your last review · 1 file +60 −0')
+    expect(await cursorOf(ui)).toBe(`line:${CWD}/long.ts:0:+line 41`)
+    expect((await codeOf(ui)).map(code => String(code.source))).toContain('@@ -0,0 +41,1 @@\n+line 41')
+    expect(await ui.find({ key: 'sticky:file:/home/demo/app/long.ts' })).toBeDefined()
+    expect(await ui.find({ key: 'enter' })).toBeDefined()
   })
 })
 
 describe('notes', () => {
-  test('c writes a note on the line the cursor is on; it shows right under the line, its mark changed, and saving it empty removes it', async ($, on) => {
+  test('c writes a note on the line the cursor is on; it shows right under the line, and saving it empty removes it', async ($, on) => {
     await started($, on, { files: { [A]: FIVE } })
     await edit($, 't1', 'a.ts', 'two', 'TWO')
     const ui = await mount($)
-    await ui.press({ key: FILE })
-    await ui.press({ key: HUNK })
+    await openFile(ui, A)
 
-    await moveTo($, ADDED)
+    await goTo(ui, ADDED)
     await note(ui, 'Name this')
+    await goTo(ui, HUNK)
     expect(await codeOf(ui)).toEqual([
       { path: A, source: '@@ -1,2 +1,2 @@\n one\n-two\n+TWO' },
       { path: A, source: '@@ -3,3 +3,3 @@\n three\n four\n five' },
     ])
-    expect(await textsOf(ui)).toContain('    ✎ Name this')
-    expect(await buttonsOf(ui, 'line:')).toEqual(['›', '✎'])
+    // The code is cut after the line, and the note drawn between.
+    expect(await shownOf(ui)).toContain('✎ Name this')
 
-    await ui.press({ key: ADDED })
+    await goTo(ui, ADDED)
+    await ui.press({ key: 'enter' })
     await ui.input({ key: 'note-field', text: '  ' })
-    expect((await textsOf(ui)).filter(text => text.includes('✎') || text.startsWith('│'))).toEqual([])
+    expect(await shownOf(ui)).not.toContain('✎ Name this')
   })
 
-  test('j and k walk the files in the list, stopping at the ends, and in a file its title and hunks', async ($, on) => {
+  test('j and k walk the files, and in the open file its hunk headers and changed lines, holding at the ends', async ($, on) => {
     await started($, on, { files: { [A]: FIVE } })
     await edit($, 't1', 'a.ts', 'two', 'TWO')
     await write($, 't2', 'b.ts', 'hello\n')
     const ui = await mount($)
+    await openFile(ui, A)
+    await goTo(ui, FILE)
 
-    for (const key of ['key-next', 'key-next', 'key-next']) {
-      await ui.press({ key })
+    const walked: (string | undefined)[] = []
+    for (let i = 0; i < 5; i += 1) {
+      walked.push(await cursorOf(ui))
+      await ui.press({ key: 'key-down' })
     }
-    await ui.press({ key: 'key-note' })
-    expect(await fieldUnder(ui)).toBe(FILE)
-    await ui.press({ key: 'key-previous' })
-    await ui.press({ key: 'key-note' })
-    expect(await fieldUnder(ui)).toBe(`file:${CWD}/b.ts`)
-
-    await ui.press({ key: FILE })
-    await ui.press({ key: 'key-previous' })
-    await ui.press({ key: 'key-note' })
-    expect(await fieldUnder(ui)).toBe(FILE)
+    expect(walked).toEqual([FILE, HUNK, REMOVED, ADDED, `file:${B}`])
+    expect(await cursorOf(ui)).toBe(`file:${B}`)
+    await ui.press({ key: 'key-up' })
+    expect(await cursorOf(ui)).toBe(ADDED)
   })
 
   test('s puts the notes into the prompt box after its draft, each anchored and quoted, in the order of the rows', async ($, on) => {
     const project = await started($, on, { files: { [A]: FIVE } })
     await edit($, 't1', 'a.ts', 'two', 'TWO')
     const ui = await mount($)
-    await moveTo($, FILE)
+    await goTo(ui, FILE)
     await note(ui, 'Why this file?')
-    await ui.press({ key: FILE })
-    await moveTo($, HUNK)
+    await openFile(ui, A)
+    await goTo(ui, HUNK)
     await note(ui, 'Smaller, please')
-    await ui.press({ key: HUNK })
-    await moveTo($, ADDED)
+    await goTo(ui, ADDED)
     await note(ui, 'Name this')
-    await moveTo($, REMOVED)
+    await goTo(ui, REMOVED)
     await note(ui, 'Keep the old one?')
     project.draft.text = 'Before you go on:'
 
@@ -260,9 +397,9 @@ describe('notes', () => {
     const project = await started($, on, { files: { [A]: FIVE } })
     await write($, 't1', 'a.ts', 'ONE\nTWO\nthree\nfour\nfive\n')
     const ui = await mount($)
-    await ui.press({ key: FILE })
+    await openFile(ui, A)
 
-    await moveTo($, `hunk:${A}:0:@-one`)
+    await goTo(ui, `hunk:${A}:0:@-one`)
     await note(ui, 'Why uppercase?')
     await ui.press({ key: 'send' })
     expect(project.draft.text).toBe('Notes on the changes:\n\na.ts:1-2\n> -one\n> -two\n> +ONE\n> …\nWhy uppercase?')
@@ -272,17 +409,15 @@ describe('notes', () => {
     const project = await started($, on, { files: { [A]: FIVE } })
     await edit($, 't1', 'a.ts', 'two', 'TWO')
     const ui = await mount($)
-    await moveTo($, FILE)
+    await goTo(ui, FILE)
     await note(ui, 'Why this file?')
-    await ui.press({ key: FILE })
-    await ui.press({ key: HUNK })
-    await moveTo($, ADDED)
+    await openFile(ui, A)
+    await goTo(ui, ADDED)
     await note(ui, 'Name this')
-    await ui.press({ key: 'back' })
-    await ui.press({ key: 'back' })
+    await ui.press({ key: 'key-out' })
 
     await edit($, 't2', 'a.ts', 'TWO', 'Two')
-    expect(await textsOf(ui)).toContain('  ✎ a.ts:2 · Name this')
+    expect(await shownOf(ui)).toContain('Notes on lines changed since: ✎ a.ts:2 · Name this')
     await ui.press({ key: 'send' })
     expect(project.draft.text).toBe('Notes on the changes:\n\na.ts\nWhy this file?\n\na.ts:2 (since changed)\n> TWO\nName this')
   })
@@ -291,9 +426,8 @@ describe('notes', () => {
     const project = await started($, on, { files: { [A]: FIVE } })
     await edit($, 't1', 'a.ts', 'two', 'TWO')
     const ui = await mount($)
-    await ui.press({ key: FILE })
-    await ui.press({ key: HUNK })
-    await moveTo($, ADDED)
+    await openFile(ui, A)
+    await goTo(ui, ADDED)
     await note(ui, 'Name this')
 
     await edit($, 't2', 'a.ts', 'one', 'zero\none')
@@ -305,13 +439,12 @@ describe('notes', () => {
     const project = await started($, on, { files: { [A]: FIVE } })
     await edit($, 't1', 'a.ts', 'two', 'TWO')
     const ui = await mount($)
-    await ui.press({ key: FILE })
-    await moveTo($, HUNK)
+    await openFile(ui, A)
+    await goTo(ui, HUNK)
     await note(ui, 'Smaller, please')
-    await ui.press({ key: HUNK })
-    await moveTo($, ADDED)
+    await goTo(ui, ADDED)
     await note(ui, 'Name this')
-    await moveTo($, REMOVED)
+    await goTo(ui, REMOVED)
     await note(ui, 'Keep the old one?')
 
     project.files.set(A, `// header\n\n${project.files.get(A) ?? ''}`)
@@ -330,9 +463,8 @@ describe('notes', () => {
     const project = await started($, on, { files: { [A]: FIVE } })
     await edit($, 't1', 'a.ts', 'two', 'TWO')
     const ui = await mount($)
-    await ui.press({ key: FILE })
-    await ui.press({ key: HUNK })
-    await moveTo($, ADDED)
+    await openFile(ui, A)
+    await goTo(ui, ADDED)
     await note(ui, 'Name this')
 
     project.files.set(A, '// header\none\nTwo\nthree\nfour\nfive\n')
@@ -344,8 +476,8 @@ describe('notes', () => {
     const project = await started($, on, { files: { [A]: FIVE } })
     await edit($, 't1', 'a.ts', 'two', 'TWO')
     const ui = await mount($)
-    await ui.press({ key: FILE })
-    await moveTo($, HUNK)
+    await openFile(ui, A)
+    await goTo(ui, HUNK)
     await note(ui, 'Smaller, please')
 
     project.files.set(A, 'all new\n')
@@ -357,9 +489,8 @@ describe('notes', () => {
     const project = await started($, on, { files: { [A]: 'x\n}\ny\nz\n' } })
     await edit($, 't1', 'a.ts', 'y\n', 'y\n}\n')
     const ui = await mount($)
-    await ui.press({ key: FILE })
-    await ui.press({ key: `hunk:${A}:0:@+}` })
-    await moveTo($, `line:${A}:0:+}`)
+    await openFile(ui, A)
+    await goTo(ui, `line:${A}:0:+}`)
     await note(ui, 'Close it here?')
 
     const after = project.files.get(A) ?? ''
@@ -372,13 +503,12 @@ describe('notes', () => {
     const project = await started($, on, { files: { [A]: FIVE } })
     await edit($, 't1', 'a.ts', 'four', 'FOUR\nmore')
     const ui = await mount($)
-    await ui.press({ key: FILE })
-    await moveTo($, `hunk:${A}:0:@-four`)
+    await openFile(ui, A)
+    await goTo(ui, `hunk:${A}:0:@-four`)
     await note(ui, 'Smaller, please')
-    await ui.press({ key: `hunk:${A}:0:@-four` })
-    await moveTo($, `line:${A}:0:-four`)
+    await goTo(ui, `line:${A}:0:-four`)
     await note(ui, 'Keep the old one?')
-    await moveTo($, `line:${A}:0:+more`)
+    await goTo(ui, `line:${A}:0:+more`)
     await note(ui, 'Good')
 
     project.files.set(A, '// header\none\n// added\ntwo\nthree\nFour\nmore\nfive\n')
@@ -397,34 +527,33 @@ describe('notes', () => {
     await started($, on, { files: { [A]: FIVE } })
     await edit($, 't1', 'a.ts', 'two', 'TWO')
     const ui = await mount($)
-    await moveTo($, FILE)
+    await goTo(ui, FILE)
     await ui.press({ key: 'key-note' })
-    await moveTo($, 'key-next')
+    await moveTo($, 'enter')
 
     expect(await fieldUnder(ui)).toBeUndefined()
   })
 
   test(
-    'Esc steps back, taking the keyboard again each time: a note field closes with the note as it was, picking stops, the file goes back to the list, then the pane closes',
+    'Esc steps back, taking the keyboard again each time: a note field closes with the note as it was, the open file closes, then the pane closes',
     { plugins: [CLOSER] },
     async ($, on) => {
       const project = await started($, on, { files: { [A]: FIVE } })
       await edit($, 't1', 'a.ts', 'two', 'TWO')
       const ui = await mount($)
-      await ui.press({ key: FILE })
-      await ui.press({ key: HUNK })
-      await moveTo($, ADDED)
+      await openFile(ui, A)
+      await goTo(ui, ADDED)
       await note(ui, 'Name this')
       await ui.press({ key: 'key-note' })
 
       await closeMark($)
       expect(await fieldUnder(ui)).toBeUndefined()
-      expect(await textsOf(ui)).toContain('    ✎ Name this')
+      expect(await shownOf(ui)).toContain('✎ Name this')
       await closeMark($)
-      expect(await buttonsOf(ui, 'line:')).toEqual([])
-      await closeMark($)
-      expect(await buttonsOf(ui, 'file:')).toEqual([`${TS}a.ts +1 −1 ✎1`])
-      expect(project.opened).toEqual([{ focus: true }, { focus: true }, { focus: true }])
+      expect(await codeOf(ui)).toEqual([])
+      expect(await cursorOf(ui)).toBe(FILE)
+      expect(await listOf(ui)).toEqual([`${TS}a.ts +1 −1 ✎1`])
+      expect(project.opened).toEqual([{ focus: true }, { focus: true }])
       expect(project.closed).toEqual([])
       await closeMark($)
       expect(project.closed).toEqual(['difnote'])
@@ -435,49 +564,51 @@ describe('notes', () => {
     const project = await started($, on, { files: { [A]: FIVE } })
     await edit($, 't1', 'a.ts', 'two', 'TWO')
     const ui = await mount($)
-    await moveTo($, FILE)
+    await goTo(ui, FILE)
     await note(ui, 'Why this file?')
     project.dialog.isOpen = true
 
     await ui.press({ key: 'send' })
     expect(project.draft.text).toBe('')
     expect(project.toasts).toEqual(["The prompt box can't take the notes right now; they are kept."])
-    expect(await buttonsOf(ui, 'file:')).toEqual([`${TS}a.ts +1 −1 ✎1`])
+    expect(await listOf(ui)).toEqual([`${TS}a.ts +1 −1 ✎1`])
   })
 })
 
 describe('the review', () => {
-  test('ends when you send Claude your own prompt after the pane showed it: what Claude changes next starts the next one', async ($, on) => {
+  test('sending your notes clears nothing: the files stay listed until you mark them reviewed', async ($, on) => {
     const project = await started($, on, { files: { [A]: FIVE } })
     await edit($, 't1', 'a.ts', 'two', 'TWO')
-    await (await mount($)).unmount()
+    const ui = await mount($)
+    await goTo(ui, FILE)
+    await note(ui, 'Why this file?')
+    await ui.press({ key: 'send' })
 
-    await send($, 'Thanks, go on')
+    await send($, `${project.draft.text}\nAnd go on.`)
     await write($, 't2', 'b.ts', 'hello\n')
-    expect(await buttonsOf(await mount($), 'file:')).toEqual([`${TS}b.ts new`])
+    expect(await listOf(ui)).toEqual([`${TS}a.ts +1 −1`, `${TS}b.ts new`])
+    expect(project.store.get('baselines')).toBeUndefined()
+  })
+
+  test('r ends the review: what Claude changes next starts the next one, and where it ended is kept for a restart', async ($, on) => {
+    const project = await started($, on, { files: { [A]: FIVE } })
+    await edit($, 't1', 'a.ts', 'two', 'TWO')
+    const ui = await mount($)
+
+    await ui.press({ key: 'key-reviewed' })
+    await write($, 't2', 'b.ts', 'hello\n')
+    expect(await listOf(ui)).toEqual([`${TS}b.ts new`])
     expect(project.store.get('baselines')).toEqual({ 'session-1': 't1' })
   })
 
-  test('stays open through a slash command, while notes wait for the prompt box, and while the pane never showed it', async ($, on) => {
+  test('stays open through your own prompts and slash commands', async ($, on) => {
     await started($, on, { files: { [A]: FIVE } })
     await edit($, 't1', 'a.ts', 'two', 'TWO')
-    await send($, 'Not looked at yet')
     const ui = await mount($)
-    await send($, '/compact')
-    await moveTo($, FILE)
-    await note(ui, 'Why this file?')
+
     await send($, 'Go on')
-
-    expect(await buttonsOf(ui, 'file:')).toEqual([`${TS}a.ts +1 −1 ✎1`])
-  })
-
-  test('a prompt that something beneath refused, so Claude never got it, leaves the review open', async ($, on) => {
-    await started($, on, { files: { [A]: FIVE }, refused: ['Blocked'] })
-    await edit($, 't1', 'a.ts', 'two', 'TWO')
-    const ui = await mount($)
-
-    await send($, 'Blocked')
-    expect(await buttonsOf(ui, 'file:')).toEqual([`${TS}a.ts +1 −1`])
+    await send($, '/compact')
+    expect(await listOf(ui)).toEqual([`${TS}a.ts +1 −1`])
   })
 
   const editRecord = {
@@ -504,13 +635,22 @@ describe('the review', () => {
   test('after a restart, takes up where the last review ended', async ($, on) => {
     await started($, on, { messages: twoChanges, stored: { baselines: { 'session-1': 't1' } } })
 
-    expect(await buttonsOf(await mount($), 'file:')).toEqual([`${TS}b.ts new`])
+    expect(await listOf(await mount($))).toEqual([`${TS}b.ts new`])
+  })
+
+  test('after a restart, takes up the files marked viewed, kept for the session folder', async ($, on) => {
+    const change = changeOf('t2', 'Write', writeRecord)
+    const [file] = filesOf(change === null ? [] : [change], CWD)
+    const marks = { [CWD]: { [B]: file === undefined ? '' : fingerprintOf(file) } }
+    await started($, on, { messages: twoChanges, stored: { baselines: { 'session-1': 't1' }, viewed: marks } })
+
+    expect(await listOf(await mount($))).toEqual([`✓ b.ts new`])
   })
 
   test('after /branch, takes up where the review ended in the conversation it branched from', async ($, on) => {
     await started($, on, { messages: twoChanges, stored: { baselines: { 'parent-session': 't1' } } })
 
-    expect(await buttonsOf(await mount($), 'file:')).toEqual([`${TS}b.ts new`])
+    expect(await listOf(await mount($))).toEqual([`${TS}b.ts new`])
   })
 })
 
@@ -527,12 +667,12 @@ describe('Google Docs', () => {
       await docTool($, 't3', 'edit_document', { document: `${LINK}?tab=t.0`, mode: 'direct', ops: [] })
       const ui = await mount($)
 
-      expect(await buttonsOf(ui, 'file:')).toEqual([`${DOC_TITLE} Google Doc · 2 edits`])
-      await ui.press({ key: `file:${LINK}` })
-      expect(await textsOf(ui)).toContain(
+      expect(await listOf(ui)).toEqual(['Google Docs · 1 file', `${DOC_TITLE} Google Doc · 2 edits`])
+      await openFile(ui, LINK)
+      expect(await shownOf(ui)).toContain(
         'In Google Docs: 1 edit as suggestions, 1 edit made directly. Review it there, where suggestions wait for you and version history keeps the rest:',
       )
-      expect(await textsOf(ui)).toContain(LINK)
+      expect(await shownOf(ui)).toContain(LINK)
     },
   )
 
@@ -545,7 +685,7 @@ describe('Google Docs', () => {
       await docTool($, 't2', 'edit_document', { document: 'doc-1', ops: [] })
       await docTool($, 't3', 'get_document', { document: 'doc-1' })
 
-      expect(await buttonsOf(await mount($), 'file:')).toEqual([`${DOC_TITLE} Google Doc · 2 edits`])
+      expect(await listOf(await mount($))).toEqual(['Google Docs · 1 file', `${DOC_TITLE} Google Doc · 2 edits`])
     },
   )
 
@@ -559,7 +699,7 @@ describe('Google Docs', () => {
       await docTool($, 't3', 'create_document', { title: 'Plan' })
       await docTool($, 't4', 'edit_document', { document: 'doc-1', mode: 'comment', ops: [] })
 
-      expect(await buttonsOf(await mount($), 'file:')).toEqual(['doc-1 Google Doc · 1 edit', 'Plan Google Doc · 1 edit'])
+      expect(await listOf(await mount($))).toEqual(['Google Docs · 2 files', 'Plan Google Doc · 1 edit', 'doc-1 Google Doc · 1 edit'])
     },
   )
 
@@ -568,7 +708,7 @@ describe('Google Docs', () => {
     await docTool($, 't1', 'get_document', { document: 'doc-1' })
     await docTool($, 't2', 'edit_document', { document: 'doc-1', ops: [] })
     const ui = await mount($)
-    await moveTo($, `file:${LINK}`)
+    await goTo(ui, `file:${LINK}`)
     await note(ui, 'Keep the old heading')
 
     await ui.press({ key: 'send' })
@@ -591,9 +731,9 @@ describe('Google Docs', () => {
       await started($, on, { messages: [{ role: 'assistant', text: '', toolUses: uses }] })
       const ui = await mount($)
 
-      expect(await buttonsOf(ui, 'file:')).toEqual([`${DOC_TITLE} Google Doc · 1 edit`])
-      await ui.press({ key: `file:${LINK}` })
-      expect(await textsOf(ui)).toContain(
+      expect(await listOf(ui)).toEqual(['Google Docs · 1 file', `${DOC_TITLE} Google Doc · 1 edit`])
+      await openFile(ui, LINK)
+      expect(await shownOf(ui)).toContain(
         'In Google Docs: 1 edit made directly. Review it there, where suggestions wait for you and version history keeps the rest:',
       )
     },
@@ -607,26 +747,23 @@ describe('/resume', () => {
     project.messages = [{ role: 'assistant', text: '', toolUses: [{ tool_use_id: 't9', tool: 'Write', input: {}, result: writeRecord }] }]
 
     await $.classic.SessionStart({ source: 'resume' })
-    expect(await buttonsOf(await mount($), 'file:')).toEqual([`${TS}b.ts new`])
+    expect(await listOf(await mount($))).toEqual([`${TS}b.ts new`])
   })
 })
 
 describe('/difnote', () => {
-  test('opens the pane with the keyboard, and closes it when it is the one shown', async ($, on) => {
-    const project = await started($, on, { panes: [{ isShown: true }] })
-    await command($)
-    expect(project.closed).toEqual(['difnote'])
-    expect(project.opened).toEqual([])
-  })
-
-  test('closes the pane outright with a file open', async ($, on) => {
+  test('gives the pane shown the keyboard back rather than closing it, the open file and cursor kept', async ($, on) => {
     const project = await started($, on, { files: { [A]: FIVE }, panes: [{ isShown: true }] })
     await edit($, 't1', 'a.ts', 'two', 'TWO')
     const ui = await mount($)
-    await ui.press({ key: FILE })
+    await openFile(ui, A)
+    await goTo(ui, ADDED)
 
     await command($)
-    expect(project.closed).toEqual(['difnote'])
+    expect(project.closed).toEqual([])
+    expect(project.opened).toEqual([{ focus: true }])
+    // The cursor on a changed line: the file is still open.
+    expect(await cursorOf(ui)).toBe(ADDED)
   })
 
   test('brings the pane to the front when another is shown over it', async ($, on) => {

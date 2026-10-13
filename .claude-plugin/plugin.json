@@ -1,6 +1,6 @@
 {
   "name": "difnote",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Review the diff of what changed in the folders Claude works in since you last looked, write a note on any line or hunk, and get your notes in the prompt to edit and send back",
   "author": {
     "name": "Mark Medum Bundgaard",
@@ -37,6 +37,12 @@
       "title": "Note color",
       "description": "Your notes in the pane: a theme role such as suggestion (the default), claude or warning, or a color: #7aa2f7, rgb(122,162,247), ansi256(110) or ansi:cyan",
       "default": "suggestion"
+    },
+    "cursorColor": {
+      "type": "string",
+      "title": "Cursor color",
+      "description": "The bar beside the row the cursor is on: a theme role such as claude (the default) or suggestion, or a color: #d97757, rgb(217,119,87), ansi256(173) or ansi:yellow",
+      "default": "claude"
     },
     "quietColor": {
       "type": "string",

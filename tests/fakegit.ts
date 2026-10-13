@@ -45,10 +45,12 @@ export function runGit(disk: Disk, argv: readonly string[], cwd: string, stdin: 
   if (command === 'config --global --path --get core.excludesFile') {
     return failed(1, '')
   }
+  // difnote's own commands name their private git folder in GIT_DIR.
+  const gitDir = env.GIT_DIR ?? ''
   if (command === 'init --quiet') {
-    stores.set(`${cwd}/git`, { index: new Map(), trees: new Map(), refs: new Map(), objects: new Map() })
-    disk.written.set(`${cwd}/git/HEAD`, 'ref: refs/heads/main\n')
-    disk.written.set(`${cwd}/git/config`, '[core]\n\trepositoryformatversion = 0\n\tbare = false\n')
+    stores.set(gitDir, { index: new Map(), trees: new Map(), refs: new Map(), objects: new Map() })
+    disk.written.set(`${gitDir}/HEAD`, 'ref: refs/heads/main\n')
+    disk.written.set(`${gitDir}/config`, '[core]\n\trepositoryformatversion = 0\n\tbare = false\n')
     return done()
   }
   // The files a repository tracks though its .gitignore matches them.
@@ -63,19 +65,24 @@ export function runGit(disk: Disk, argv: readonly string[], cwd: string, stdin: 
     )
   }
 
-  const store = stores.get(cwd)
-  const config = disk.written.get(`${cwd}/config`) ?? ''
+  const store = stores.get(gitDir)
+  const config = disk.written.get(`${gitDir}/config`) ?? ''
   const tree = /worktree = "((?:[^"\\]|\\.)*)"/.exec(config)?.[1]?.replaceAll(/\\(.)/g, '$1')
-  if (!command.startsWith('--git-dir=. ') || store === undefined || tree === undefined) {
-    return failed(128, `fatal: not a git repository: ${cwd}\n`)
+  if (store === undefined || tree === undefined) {
+    return failed(128, `fatal: not a git repository: ${gitDir}\n`)
   }
-  const isIgnored = ignoring(disk, cwd, tree)
+  // Run from inside its work tree, git reads paths, and a ref's name, as
+  // that folder's files.
+  if (cwd === tree || cwd.startsWith(`${tree}/`)) {
+    return failed(128, `fatal: ambiguous argument: run from ${cwd}, inside the work tree\n`)
+  }
+  const isIgnored = ignoring(disk, gitDir, tree)
   const inside = [...disk.files.keys()].filter(path => path.startsWith(`${tree}/`)).map(path => path.slice(tree.length + 1))
   const nested = disk.repos.filter(repo => repo.startsWith(`${tree}/`)).map(repo => repo.slice(tree.length + 1))
   const inNested = (path: string) => nested.some(repo => path.startsWith(`${repo}/`))
   const paths = stdin.split('\0').filter(path => path !== '')
 
-  switch (command.slice('--git-dir=. '.length)) {
+  switch (command) {
     case 'ls-files -z --others --exclude-standard':
       return done(
         [
@@ -144,10 +151,13 @@ export function runGit(disk: Disk, argv: readonly string[], cwd: string, stdin: 
     case 'update-ref --stdin':
       for (const line of stdin.split('\n').filter(one => one !== '')) {
         const [verb, ref = '', id = ''] = line.split(' ')
+        // git keeps each in a file of its own, which difnote reads.
         if (verb === 'delete') {
           store.refs.delete(ref)
+          disk.written.delete(`${gitDir}/${ref}`)
         } else {
           store.refs.set(ref, id)
+          disk.written.set(`${gitDir}/${ref}`, `${id}\n`)
         }
       }
       return done()
@@ -155,7 +165,7 @@ export function runGit(disk: Disk, argv: readonly string[], cwd: string, stdin: 
       const id = store.refs.get('refs/difnote/base')
       return id === undefined ? failed(1, '') : done(`${id}\n`)
     }
-    case 'diff-tree -r -z --no-renames --no-ext-diff --no-textconv --patch-with-raw -U3 refs/difnote/base refs/difnote/shown':
+    case 'diff-tree -r -z --no-renames --no-ext-diff --no-textconv --patch-with-raw -U3 refs/difnote/base refs/difnote/shown --':
       return done(
         diffOf(
           store,

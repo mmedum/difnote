@@ -299,6 +299,10 @@ export function placeOf(row: Row, rows: readonly Row[], file: string): { shift: 
   return { shift: 0, changed: true }
 }
 
+// The line that heads the notes in the prompt box; the prompt you send with
+// it ends the review.
+export const NOTES_HEADER = 'Notes on the changes:'
+
 // The notes as they go into the prompt box: one line saying what they are,
 // then each note's anchor, the code it quotes and the person's words, in
 // the order of the rows they are on. Each anchor is where its row is in the
@@ -322,7 +326,7 @@ export function promptOf(notes: readonly Note[], rows: readonly Row[], files: Re
       return [changed ? `${anchor} (since changed)` : anchor, ...quote.map(line => `> ${line}`), note.text].join('\n')
     })
 
-  return ['Notes on the changes:', ...blocks].join('\n\n')
+  return [NOTES_HEADER, ...blocks].join('\n\n')
 }
 
 function isHunk(value: unknown): value is Hunk {
@@ -339,6 +343,17 @@ function isHunk(value: unknown): value is Hunk {
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+// A file's change as a short fingerprint: the same while its change is the
+// same, another once anything in it changes, as when Claude edits it again.
+export function fingerprintOf(file: FileDiff): string {
+  const text = JSON.stringify([file.isCreate, file.isDelete, file.bare, file.doc, file.hunks])
+  let hash = 0x811c9dc5
+  for (let i = 0; i < text.length; i += 1) {
+    hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193) >>> 0
+  }
+  return `${hash.toString(16)}:${text.length}`
 }
 
 // A hunk as unified-diff text, as Claude Code's highlighter reads it: its
