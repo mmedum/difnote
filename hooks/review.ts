@@ -165,7 +165,7 @@ export function shownPath(path: string, cwd: string): string {
 export type Row =
   | { kind: 'file'; key: string; file: FileDiff }
   | { kind: 'hunk'; key: string; file: FileDiff; hunk: Hunk; from: number; to: number; changed: string[] }
-  | { kind: 'line'; key: string; file: FileDiff; sign: '+' | '-'; text: string; at: number }
+  | { kind: 'line'; key: string; file: FileDiff; sign: '+' | '-'; text: string; at: number; gutter: number }
   | { kind: 'context'; key: string; file: FileDiff; text: string; at: number }
 
 // What a row's key holds of a line's text: enough to tell a line Claude
@@ -174,7 +174,8 @@ const KEY_TEXT = 60
 
 // The rows of the files. A line's `at` is its number in the file after
 // Claude's change, or, for a removed line, the number of the line now in
-// its place. A changed line's key names its file, its side, its text and
+// its place; its `gutter`, the number the diff draws beside it, a removed
+// line's in the file before. A changed line's key names its file, its side, its text and
 // which of the lines with that text it is, not its number, so lines Claude
 // adds or removes above it leave a note on it where it was; a hunk's, its
 // first changed line the same way.
@@ -196,10 +197,10 @@ export function rowsOf(files: readonly FileDiff[]): Row[] {
         for (const line of hunk.lines) {
           const text = line.slice(1)
           if (line.startsWith('+')) {
-            lines.push({ kind: 'line', key: `line:${file.path}:${nth(line)}`, file, sign: '+', text, at: newLine })
+            lines.push({ kind: 'line', key: `line:${file.path}:${nth(line)}`, file, sign: '+', text, at: newLine, gutter: newLine })
             newLine += 1
           } else if (line.startsWith('-')) {
-            lines.push({ kind: 'line', key: `line:${file.path}:${nth(line)}`, file, sign: '-', text, at: newLine })
+            lines.push({ kind: 'line', key: `line:${file.path}:${nth(line)}`, file, sign: '-', text, at: newLine, gutter: oldLine })
             oldLine += 1
           } else if (line.startsWith(' ')) {
             lines.push({ kind: 'context', key: `context:${file.path}:${newLine}`, file, text, at: newLine })

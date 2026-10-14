@@ -67,6 +67,7 @@ export type Actions = {
   send: () => void
   reviewed: () => void
   drop: () => void
+  close: () => void
   save: (row: Row, text: string) => void
 }
 
@@ -645,6 +646,7 @@ export function keysOf(view: PaneView, item: Item | undefined, order: readonly F
         : []),
     ...(item !== undefined ? [{ key: 'key-down', hotkey: 'j', label: 'down', act: 'down' } as const] : []),
     ...(item !== undefined ? [{ key: 'key-up', hotkey: 'k', label: 'up', act: 'up' } as const] : []),
+    { key: 'key-close', hotkey: 'q', label: 'close', act: 'close' },
   ]
 }
 
@@ -1041,7 +1043,7 @@ function fieldOf(view: PaneView, row: Row, actions: Actions): RenderElement {
     return <ui.Text color={colors.quiet}>{fit('  Notes need the terminal or the desktop app.', view.columns)}</ui.Text>
   }
   const was = notes.find(note => note.target === row.key)?.text ?? ''
-  const label = row.kind === 'line' ? `✎ ${row.at}${row.sign === '-' ? ' (removed)' : ''}` : '✎'
+  const label = row.kind === 'line' ? `✎ ${row.gutter}${row.sign === '-' ? ' (removed)' : ''}` : '✎'
   return (
     <ui.Box key={`field:${row.key}`} paddingLeft={2} flexShrink={0}>
       <Input
@@ -1075,7 +1077,6 @@ function footerOf(view: PaneView, layout: Layout, actions: Actions): RenderEleme
           <ui.Button key={one.key} plain hotkey={one.hotkey} label={one.label} onPress={actions[one.act]} />
         ),
       )}
-      {layout.keys.length === 0 && <ui.Text color={colors.quiet}>Esc close</ui.Text>}
     </ui.Box>
   )
 }

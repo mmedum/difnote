@@ -37,7 +37,7 @@ Third-party marketplaces don't update on their own. To update, run `claude plugi
 
 ## Using it
 
-`/difnote` opens its pane with the keyboard. With the pane open, behind another tab or with the keyboard in the prompt box, it gives the pane the keyboard again, where you left it. Esc steps back one level at a time and closes the pane last, as `/diff`'s dialog does. Claude Code puts every mod's pane in the same dock beside the transcript (in a wide fullscreen terminal; otherwise above the prompt), one at a time as tabs: ctrl+x tab switches between them. difnote asks for a dock 100 columns wide, but a width you set yourself wins; ctrl+x ← widens the dock, ctrl+x → narrows it again.
+`/difnote` opens its pane with the keyboard. With the pane open, behind another tab or with the keyboard in the prompt box, it gives the pane the keyboard again, where you left it; so does ctrl+x tab, also when the prompt box holds text, where `/difnote` can't be typed. Esc steps back one level at a time, out of a note, then out of the open file, and at the top gives the keyboard back to the prompt box, the pane staying open. `q` closes the pane. Claude Code puts every mod's pane in the same dock beside the transcript (in a wide fullscreen terminal; otherwise above the prompt), one at a time as tabs: ctrl+x tab switches between them. difnote asks for a dock 100 columns wide, but a width you set yourself wins; ctrl+x ← widens the dock, ctrl+x → narrows it again.
 
 - **One list:** the files changed since your last review, under a heading for each folder they are in, folders first and each by name; with more than one place, as another repository, under a heading for each place too. Each file shows its icon, what it adds and removes, and how many notes it has. The top line says since when, and stays at the top; the keys stay at the bottom.
 - **A file opens in place:** Enter or `l` opens a file's hunks right under its row, and closes the file open before, as one file is open at a time. Each hunk sits under a header, drawn as Claude Code's own highlighted diff, long lines wrapped after the line numbers, each note right under the line it's on. `h` or Esc closes the file, the cursor back on its row; `n` opens the next file. Scrolled down a long file, its row stays at the top.
@@ -57,7 +57,8 @@ Third-party marketplaces don't update on their own. To update, run `claude plugi
 | `s`            | put the notes into the prompt box, after your draft                                      |
 | `r`            | with no notes waiting, mark everything shown reviewed, after asking                      |
 | `x`            | on a folder from earlier sessions, stop watching it from here                            |
-| Esc            | back one level: cancel a note, close the open file, close the pane                       |
+| `q`            | close the pane                                                                           |
+| Esc            | back one level: cancel a note, close the open file; at the top, back to the prompt box   |
 
 The keys at the bottom are the ones that work on the row the cursor is on.
 
@@ -68,7 +69,7 @@ The keys at the bottom are the ones that work on the row the cursor is on.
 - **Google Docs:** a Google Doc Claude edited through a Google Docs server's tools ([google-docs-mcp](https://github.com/mmedum/google-docs-mcp)'s `edit_document`, `format_document`, `edit_table`, `insert_object`, `layout_document`, `manage_tabs`, `delete_tab`, `review_suggestion` or `create_document`) shows as one row, by its title once Claude has read it. Opening it says how many edits were made as suggestions, directly or as comments, with its link: you review it in Google Docs, where suggestions wait for you to accept or reject them. A note on it goes into the prompt with its title and link.
 - **Viewed files:** `v` marks the file the cursor is on, or the one open, viewed: its row goes quiet with a ✓, an open file closes, and the cursor goes on to the next file not yet viewed. The mark drops by itself once the file changes again, as when Claude acts on your notes, so the file shows again with what changed. `v` on a viewed file unmarks it. Marks stay through `/clear` and restarts, kept for the folder the session runs in.
 - **When a review ends:** only when you press `r` and answer **Mark reviewed** (a review can't be undone). Sending your notes, your other prompts and slash commands leave the list as it is, so you can go on reviewing while Claude works. What the pane showed counts as reviewed, also what it picked up by itself while it was open; anything that changed after its last look shows next time. The reviewed state belongs to the folder, so it holds across sessions: another session's review in the same folder moves it for both.
-- **The notes in the prompt:** a note on a line quotes it, one on a removed line says so, one on a hunk quotes its first changed lines with their `-` and `+`, and one on a file gives its path. When you press `s`, difnote reads each file you wrote notes on and numbers each note where its code is now, so lines added or removed since the pane looked don't throw the numbers off. A note on a line the file no longer has says `(since changed)`, numbered by the lines left around it. If a dialog holds the prompt box, the notes stay in the pane and a message says so.
+- **The notes in the prompt:** a note on a line quotes it, one on a removed line says so and takes the number of the line now in its place (in the pane, its field names it by its old number, as the diff's gutter does), one on a hunk quotes its first changed lines with their `-` and `+`, and one on a file gives its path. When you press `s`, difnote reads each file you wrote notes on and numbers each note where its code is now, so lines added or removed since the pane looked don't throw the numbers off. A note on a line the file no longer has says `(since changed)`, numbered by the lines left around it. If a dialog holds the prompt box, the notes stay in the pane and a message says so. With the notes in the prompt box, ctrl+x tab goes back into the pane (with more than one mod's pane open, press it until difnote's tab is in front).
 
 ## Settings
 
@@ -91,7 +92,7 @@ For each folder it watches, difnote keeps a private git folder in Claude Code's 
 
 ### What it runs
 
-`git`, and only `git`. Each command is written out in full in `hooks/register.tsx`; the paths and ids that differ from call to call go on its standard input, never on its command line. Your own git settings are switched off for difnote's commands (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, and no settings given through the environment), except to ask for your global ignore file, so they can't change what difnote records. Each command also names the git folder it works on, its work tree and its index in git's own variables (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` and their kin), so none that Claude Code was started with can point it elsewhere.
+`git`, and only `git`. difnote starts no shell, and never runs a command it read in the conversation: a shell command of Claude's is only searched for the folder paths it names. Each command is written out in full in `hooks/register.tsx`; the paths and ids that differ from call to call go on its standard input, never on its command line. Your own git settings are switched off for difnote's commands (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, and no settings given through the environment), except to ask for your global ignore file, so they can't change what difnote records. Each command also names the git folder it works on, its work tree and its index in git's own variables (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` and their kin), so none that Claude Code was started with can point it elsewhere.
 
 | Command                                                                     | Runs                                                               | Why                                                                                                                                    |
 | --------------------------------------------------------------------------- | ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
@@ -118,6 +119,15 @@ A folder is recorded when the pane opens, after Claude's tool calls, when you mo
 
 All but `version`, `config` and the one that reads your repository work on difnote's private git folder, which git's own variables name, and run from `/`, never from inside a folder difnote watches, where git would read a path as that folder's file. Whether a folder is in a git repository, and where its top is, difnote finds by looking for a `.git` folder or file above it, without running git. Git runs with Claude Code's own rule for mods: your repository's hooks are off.
 
+### What it sends, and where
+
+Nothing leaves your machine. difnote hands data to two places, both on your machine:
+
+- **`git`**, which it starts (`$.process.run`) with the commands above: the paths of the files to record, on its standard input, and the files themselves, which git reads from your folder into difnote's private git folder. None of these commands contacts a remote or the network; there is no `fetch`, `push`, `clone` or `remote` among them.
+- **The prompt box**, when you press `s` (`$.prompt.fill`): your notes, with the lines they quote. You send them yourself.
+
+What it reads of the conversation (the paths and results of Claude's file edits, the paths in its shell commands, a Google Doc's title and link) only decides which folders git records and what the pane shows.
+
 ### What it reads
 
 - The folders it watches, through git, as above, and each changed file's size and time (`$.fs.list`, `$.fs.stat`). Of your own repositories: whether a folder holds a `.git` folder or file, to find where a repository starts; a `.git` file's and the git folder's `commondir`, for a work tree or a submodule; `.git/info/exclude`, which it copies into its private git folder so its records ignore what yours do; and, through git, the list of files the repository tracks. It writes nothing there.
@@ -128,6 +138,7 @@ All but `version`, `config` and the one that reads your repository work on difno
 - The files you wrote notes on, when you press `s` (`$.fs.read`), to number each note where its code is in the file now.
 - Of its own private git folders, the file that holds the id of the state you last reviewed (`refs/difnote/base`, or `packed-refs` once git packed it), so a look by itself notices a review made in another session.
 - The session's id and folder, and the color options.
+- No credentials: no token, key or password, and no environment variable. A file named like a secret is never read, only its size and time (`$.fs.stat`); the names are in the code only so difnote can leave such files out. Of your git settings, it asks only for the path of your global ignore file.
 
 ### What it keeps, and where
 
@@ -137,7 +148,8 @@ All but `version`, `config` and the one that reads your repository work on difno
 ### What it writes
 
 - Your notes into the prompt box when you press `s` (`$.prompt.fill`, after the draft). You send them yourself.
-- Its private git folders and the plugin store, as above. Nothing in your own folders.
+- In each of its private git folders, under its data folder (`roots/<folder>/`): git's own settings file, `git/config` (the folder it records as git's work tree, and settings that keep git from logging, packing by itself, converting line endings or using a file monitor), and ignore file, `git/info/exclude` (what the records leave out), which git follows when difnote runs it there; and a `folder` file naming the folder it records. These are difnote's own files: it writes no settings, build, start-up or instructions file of yours, or of any other program.
+- The plugin store, as above. Nothing in your own folders.
 
 ### What its hooks change
 

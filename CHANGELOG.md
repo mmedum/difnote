@@ -4,6 +4,24 @@ Notable changes to difnote. The format follows [Keep a Changelog](https://keepac
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-14
+
+### Added
+
+- `q` closes the pane. It is the last key at the bottom, on every row.
+
+### Changed
+
+- At the top of the pane, Esc gives the keyboard back to the prompt box and the pane stays open; it no longer closes the pane. In a note or an open file, Esc still steps back first. `q`, ctrl+x x or the pane's close mark close it.
+- How it works in the README now says what difnote sends and where (nothing leaves your machine), which settings files it writes (only its own git folders' `config` and `info/exclude`), and that it reads no credentials.
+
+### Fixed
+
+- After the terminal was resized, the pane could stay scrolled, the summary above its top, until the next key.
+- A note field on a removed line named the line by the number of the line now in its place; it now names it by the number beside it, the old file's.
+- `/difnote` on an empty pane, and Claude's tool call that first filled one, could wait most of a second for a button the pane didn't draw yet.
+- `s` read every file that had a note, also one with a note on the whole file only, such as a file named like a secret; it now reads only the files with notes on their lines or hunks, to number them.
+
 ## [0.2.0] - 2026-10-14
 
 ### Added
@@ -42,6 +60,7 @@ Notable changes to difnote. The format follows [Keep a Changelog](https://keepac
 - A review ends when you send Claude your own prompt after the pane showed it, unless notes are waiting, or when you press `r`. What the pane showed counts as reviewed, across sessions.
 - Options: File icons, and colors for added and removed counts, notes and quiet text.
 
-[Unreleased]: https://github.com/mmedum/difnote/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/mmedum/difnote/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/mmedum/difnote/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mmedum/difnote/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mmedum/difnote/releases/tag/v0.1.0

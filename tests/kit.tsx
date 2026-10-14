@@ -32,7 +32,9 @@ export type Project = Disk & {
   store: Map<string, unknown>
   // What Claude Code stored of the conversation, as $.session.messages reads it.
   messages: SessionMessage[]
-  opened: { focus: boolean }[]
+  opened: { focus: boolean; escape: boolean }[]
+  // Every file difnote read with $.fs.read, in order.
+  reads: string[]
   closed: string[]
   // Whether the pane is open, and shown in front; what the person answers a
   // question, and what they do while it is asked.
@@ -85,6 +87,7 @@ export async function started($: Engine, on: On, options: StartOptions = {}): Pr
     store: new Map(Object.entries(options.stored ?? {})),
     messages: options.messages ?? [],
     opened: [],
+    reads: [],
     closed: [],
     pane: { isOpen: options.panes !== undefined && options.panes.length > 0, isShown: options.panes?.[0]?.isShown ?? false },
     answer: 'Mark reviewed',
@@ -95,6 +98,7 @@ export async function started($: Engine, on: On, options: StartOptions = {}): Pr
   on('session.id', () => ({ value: SESSION }))
   on('session.messages', () => ({ value: project.messages }))
   on('fs.read', (_$, e) => {
+    project.reads.push(e.path)
     const text = project.files.get(e.path) ?? project.written.get(e.path)
     if (text === undefined) {
       throw new Error(`no such file: ${e.path}`)
@@ -173,7 +177,7 @@ export async function started($: Engine, on: On, options: StartOptions = {}): Pr
     return { value: undefined }
   })
   on('ui.open', (_$, e) => {
-    project.opened.push({ focus: e.focus === true })
+    project.opened.push({ focus: e.focus === true, escape: e.closeOnEscape === true })
     project.pane = { isOpen: true, isShown: true }
     return { value: { isPlaced: true } }
   })

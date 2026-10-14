@@ -2,7 +2,7 @@
 // reviewed, one diff per file, lets you write a note on a line, a hunk or a
 // file, and puts the notes into the prompt box for you to edit and send.
 
-import type { EngineInterface, Register, Timer } from 'claude-code'
+import type { EngineInterface, ProcessRunResult, Register, Timer } from 'claude-code'
 import { atom, read, update } from 'claude-code'
 import type { Change, FileDiff, Note, Place, Watch } from '../types'
 import type { Places } from './folders'
@@ -287,7 +287,8 @@ async function refresh($: EngineInterface, isTimer = false) {
   if (!isSame) {
     const hadFiles = (await filesNow($)).length > 0
     await update($, diffs, () => filesOfLook(now))
-    await parkWhenListed($, hadFiles)
+    void parkWhenListed($, hadFiles).catch(() => undefined)
+    await askEscape($)
   }
   const said = watchOf()
   if (JSON.stringify(said) !== JSON.stringify(await read($, watch))) {
@@ -343,6 +344,7 @@ async function tick($: EngineInterface) {
 // Closes the note field; a look by itself held while it was open is made.
 async function closeField($: EngineInterface) {
   await update($, editing, () => null)
+  await askEscape($)
   if (isHeld) {
     isHeld = false
     if (isOpen) {
@@ -408,6 +410,7 @@ async function markReviewed(
   }
   // What was marked viewed is reviewed now.
   await setViewed($, {})
+  await askEscape($)
   if (await isShown($)) {
     void refresh($).catch(() => undefined)
   }
@@ -461,6 +464,7 @@ async function dropFolder($: EngineInterface) {
     await update($, diffs, () => filesOfLook(now))
   }
   await update($, watch, () => watchOf())
+  await askEscape($)
   await park($)
 }
 
@@ -473,8 +477,10 @@ async function sendNotes($: EngineInterface, rows: readonly Row[]) {
     return
   }
   // The files the notes are on, as they are now, so each note points where
-  // its line stands; a file that can't be read keeps the numbers it had.
-  const paths = [...new Set(list.map(note => note.path))]
+  // its line stands; a file that can't be read keeps the numbers it had. A
+  // note on a whole file has no number, and its file isn't read: one named
+  // like a secret never is.
+  const paths = [...new Set(list.filter(note => !note.target.startsWith('file:')).map(note => note.path))]
   const reads = await Promise.all(paths.map(async path => [path, await $.fs.read(path).catch(() => null)] as const))
   const files = new Map(reads.flatMap(([path, text]) => (typeof text === 'string' ? [[path, text] as const] : [])))
   const draft = await $.prompt.read()
@@ -508,7 +514,7 @@ async function saveNote($: EngineInterface, row: Row, text: string) {
 
 // /difnote gives the pane the keyboard, opening it, bringing it to the
 // front of the dock or taking the keyboard back from the prompt, and looks
-// again. Esc closes the pane (see stepBack).
+// again. q closes the pane (see closePane).
 async function showPane($: EngineInterface) {
   await openPane($)
   setOpen($, true)
@@ -517,19 +523,23 @@ async function showPane($: EngineInterface) {
 
 async function openField($: EngineInterface, row: Row) {
   await update($, editing, () => row.key)
+  await askEscape($)
   await $.ui.focus({ requestId: PANE, key: FIELD }).catch(() => undefined)
 }
 
 // Opens the pane with the keyboard, on the button Enter presses, or on a
 // note field left open: none is drawn for Enter while one is, and a park
 // would wait for it, the keyboard at the prompt meanwhile. Esc steps back
-// (see stepBack). Docked, the pane asks for room for code; a width the
+// (see askEscape). Docked, the pane asks for room for code; a width the
 // person set the dock to wins.
 async function openPane($: EngineInterface) {
-  await $.ui.open({ id: PANE, title: 'difnote', focus: true, closeOnEscape: true, columns: DOCK_COLUMNS, rows: INLINE_ROWS })
+  const steps = await hasStep($)
+  await $.ui.open({ ...paneOpen(steps), focus: true })
+  escapes = steps
   if ((await read($, editing)) !== null) {
     await $.ui.focus({ requestId: PANE, key: FIELD }).catch(() => undefined)
-  } else {
+  } else if ((await filesNow($)).length > 0) {
+    // An empty pane draws no button for Enter (see parkWhenListed).
     await park($)
   }
 }
@@ -554,10 +564,62 @@ async function parkWhenListed($: EngineInterface, hadFiles: boolean) {
   }
 }
 
-// Esc, the close mark or another plugin's close while the pane is open: one
-// step back, the way /diff's dialog goes. A note field closes, leaving the
-// note as it was; an open file closes, the cursor on its row. Only then does
-// the pane close.
+// The pane as difnote opens it: its title and size, and whether Esc asks
+// to close it, which it does only while there is a step to take back
+// (see stepBack).
+function paneOpen(steps: boolean) {
+  return { id: PANE, title: 'difnote', columns: DOCK_COLUMNS, rows: INLINE_ROWS, ...(steps ? { closeOnEscape: true as const } : {}) }
+}
+
+// Whether the pane, as last opened, asks Esc to close it; null where
+// difnote doesn't know, as for a pane Claude Code kept open through a
+// restart.
+let escapes: boolean | null = null
+
+// The pane's size at its last drawing, columns by rows.
+let drawnSize = ''
+
+// Esc goes back one step at a time: while a note field or a file is open,
+// it asks to close the pane, a close difnote refuses to step back instead.
+// At the top it hands the keyboard back to the prompt box and the pane
+// stays, as glimt's Esc does; q closes it. An open pane takes the new
+// manners when opened again, as a title; only one in front, so another
+// tab stays in front of it. One behind, or one Claude Code kept open
+// through a restart, takes them when the person moves in it (closeField)
+// or with /difnote.
+async function askEscape($: EngineInterface) {
+  const steps = await hasStep($)
+  if (!isOpen || steps === escapes || !(await isShown($))) {
+    return
+  }
+  await $.ui.open(paneOpen(steps)).then(
+    () => {
+      escapes = steps
+    },
+    () => undefined,
+  )
+}
+
+// q: closes the pane with difnote's own close, which passes no ui.close hook
+// of difnote's; refused, the pane stays as it was.
+async function closePane($: EngineInterface) {
+  await $.ui.close({ id: PANE }).then(
+    () => whenClosed($),
+    () => undefined,
+  )
+}
+
+// The pane closed: its looks by themselves stop, and it forgets where the
+// person was.
+async function whenClosed($: EngineInterface) {
+  setOpen($, false)
+  await forget($)
+}
+
+// Esc, the close mark or another plugin's close while a note field or a file
+// is open: one step back, the way /diff's dialog goes. A note field closes,
+// leaving the note as it was; an open file closes, the cursor on its row.
+// Only then does the close mark close the pane.
 async function stepBack($: EngineInterface) {
   if ((await read($, editing)) !== null) {
     await closeField($)
@@ -570,9 +632,15 @@ async function stepBack($: EngineInterface) {
   }
 }
 
-// Whether there is a step to take back before the pane closes.
+// Whether there is a step to take back before the pane closes: a note
+// field, or a file open that is still listed (a review or Claude's undo can
+// take it out of the list).
 async function hasStep($: EngineInterface): Promise<boolean> {
-  return (await read($, editing)) !== null || (await read($, place)).open !== null
+  if ((await read($, editing)) !== null) {
+    return true
+  }
+  const { open } = await read($, place)
+  return open !== null && (await filesNow($)).some(file => file.path === open)
 }
 
 // Closed, the pane forgets the file it had open, its cursor and an open note
@@ -587,6 +655,9 @@ async function forget($: EngineInterface) {
 async function moveTo($: EngineInterface, key: string | null, change: Partial<Place> = {}) {
   const top = layout?.top ?? 0
   await update($, place, was => ({ ...was, top, ...change, cursor: key }))
+  if ('open' in change) {
+    await askEscape($)
+  }
   await park($)
 }
 
@@ -826,6 +897,7 @@ function actionsOf($: EngineInterface, rows: readonly Row[]): Actions {
     send: run(() => sendNotes($, rows)),
     reviewed: run(() => confirmReviewed($)),
     drop: run(() => dropFolder($)),
+    close: run(() => closePane($)),
     save: (row, text) => void saveNote($, row, text).catch(() => undefined),
   }
 }
@@ -860,8 +932,6 @@ function changedBy(result: unknown): string[] {
 // Code's data folder for difnote, which records the folder before Claude
 // first changes it and again each time the pane looks; the pane shows what
 // changed since the state the person last reviewed, whoever changed it.
-
-type RunResult = Awaited<ReturnType<EngineInterface['process']['run']>>
 
 // A folder difnote knows of: watched, with its private git folder, what kind
 // of folder it is, and whether its first record is in (`ready` resolves
@@ -1693,7 +1763,7 @@ type Command =
 // that git's own variables name (envOf), in OWN. What differs from call to
 // call, paths and ids, goes on standard input. The README says when and why
 // each runs.
-function git($: EngineInterface, command: Command, folder: string, init: Init = {}): Promise<RunResult> {
+function git($: EngineInterface, command: Command, folder: string, init: Init = {}): Promise<ProcessRunResult> {
   const options = {
     cwd: folder,
     env: init.env ?? ENV,
@@ -1738,7 +1808,7 @@ function git($: EngineInterface, command: Command, folder: string, init: Init = 
     ignored: () => $.process.run(['git', 'check-ignore', '-z', '--stdin'], options),
     empty: () => $.process.run(['git', 'read-tree', '--empty'], options),
     gc: () => $.process.run(['git', 'gc', '--quiet', '--prune=1.hour.ago'], options),
-  } satisfies Record<Command, () => Promise<RunResult>>
+  } satisfies Record<Command, () => Promise<ProcessRunResult>>
   return commands[command]()
 }
 
@@ -1747,7 +1817,7 @@ function git($: EngineInterface, command: Command, folder: string, init: Init = 
 const LOCK_TRIES = 10
 const LOCK_MS = 300
 
-async function inGit($: EngineInterface, entry: Watched, command: Command, init: Omit<Init, 'env'> = {}): Promise<RunResult> {
+async function inGit($: EngineInterface, entry: Watched, command: Command, init: Omit<Init, 'env'> = {}): Promise<ProcessRunResult> {
   for (let tries = 0; ; tries += 1) {
     const ran = await git($, command, OWN, { ...init, env: envOf(entry.git, entry.folder) })
     if (ran.exitCode === 0 || !ran.stderr.includes('.lock') || tries >= LOCK_TRIES) {
@@ -1757,7 +1827,7 @@ async function inGit($: EngineInterface, entry: Watched, command: Command, init:
   }
 }
 
-function ok(ran: RunResult, what: string): RunResult {
+function ok(ran: ProcessRunResult, what: string): ProcessRunResult {
   if (ran.exitCode !== 0) {
     throw new Skip(`${what}: ${firstLine(ran.stderr)}`)
   }
@@ -1853,7 +1923,9 @@ export const register: Register = (on, options) => {
     if (change !== null) {
       const hadFiles = (await filesNow($).catch(() => [])).length > 0
       await update($, changes, list => (list.some(one => one.id === change.id) ? list : kept([...list, change]))).catch(() => undefined)
-      await parkWhenListed($, hadFiles).catch(() => undefined)
+      // Claude's call goes on meanwhile: a park can wait for its button.
+      void parkWhenListed($, hadFiles).catch(() => undefined)
+      await askEscape($).catch(() => undefined)
     }
     // The folders Claude changed: an Edit's or a Write's, and those of the
     // files Claude Code says a shell command changed. A command that only
@@ -1900,8 +1972,7 @@ export const register: Register = (on, options) => {
     }
     const answered = await next(e)
     if (e.id === PANE && answered.deny === undefined) {
-      setOpen($, false)
-      await forget($).catch(() => undefined)
+      await whenClosed($).catch(() => undefined)
     }
 
     return answered
@@ -1947,10 +2018,14 @@ export const register: Register = (on, options) => {
     }
     layout = layoutOf(view)
     // difnote's window starts at the top of the tree; the engine's moved off
-    // it (as when the element the ring was on goes) is put back.
-    if (e.props.scroll.offset > 0) {
+    // it (as when the element the ring was on goes) is put back. After the
+    // terminal is resized the engine moves it once this drawing is in, which
+    // the drawing can't see: it is put back then too.
+    const size = `${e.props.bodyColumns}x${e.props.scroll.bodyRows}`
+    if (e.props.scroll.offset > 0 || size !== drawnSize) {
       void $.ui.scroll({ to: 'start', in: PANE }).catch(() => undefined)
     }
+    drawnSize = size
 
     return paneOf(view, layout, actionsOf($, rows))
   })

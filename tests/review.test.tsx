@@ -345,6 +345,17 @@ describe('notes', () => {
     expect(await shownOf(ui)).not.toContain('✎ Name this')
   })
 
+  test("a note field on a removed line names it by the number beside it, the file's before the change", async ($, on) => {
+    await started($, on, { files: { [A]: FIVE } })
+    await write($, 't1', 'a.ts', 'ONE\nTWO\nthree\nfour\nfive\n')
+    const ui = await mount($)
+    await openFile(ui, A)
+
+    await goTo(ui, REMOVED)
+    await ui.press({ key: 'key-note' })
+    expect((await ui.find({ key: 'note-field' }))?.props.label).toBe('✎ 2 (removed)')
+  })
+
   test('j and k walk the files, and in the open file its hunk headers and changed lines, holding at the ends', async ($, on) => {
     await started($, on, { files: { [A]: FIVE } })
     await edit($, 't1', 'a.ts', 'two', 'TWO')
@@ -553,7 +564,10 @@ describe('notes', () => {
       expect(await codeOf(ui)).toEqual([])
       expect(await cursorOf(ui)).toBe(FILE)
       expect(await listOf(ui)).toEqual([`${TS}a.ts +1 −1 ✎1`])
-      expect(project.opened).toEqual([{ focus: true }, { focus: true }])
+      expect(project.opened).toEqual([
+        { focus: true, escape: true },
+        { focus: true, escape: true },
+      ])
       expect(project.closed).toEqual([])
       await closeMark($)
       expect(project.closed).toEqual(['difnote'])
@@ -761,7 +775,13 @@ describe('/difnote', () => {
 
     await command($)
     expect(project.closed).toEqual([])
-    expect(project.opened).toEqual([{ focus: true }])
+    // The pane kept open through the restart was asked anew as the person
+    // moved in it; the file opened in it asked Esc to step back.
+    expect(project.opened).toEqual([
+      { focus: false, escape: false },
+      { focus: false, escape: true },
+      { focus: true, escape: true },
+    ])
     // The cursor on a changed line: the file is still open.
     expect(await cursorOf(ui)).toBe(ADDED)
   })
@@ -769,6 +789,92 @@ describe('/difnote', () => {
   test('brings the pane to the front when another is shown over it', async ($, on) => {
     const project = await started($, on, { panes: [{ isShown: false }] })
     await command($)
-    expect(project.opened).toEqual([{ focus: true }])
+    expect(project.opened).toEqual([{ focus: true, escape: false }])
   })
 })
+
+describe('Esc and q', () => {
+  test('Esc asks to close the pane only while a file is open, which closes the file: at the top it hands the keyboard back', async ($, on) => {
+    const project = await started($, on, { files: { [A]: FIVE } })
+    await edit($, 't1', 'a.ts', 'two', 'TWO')
+    const ui = await mount($)
+    await command($)
+
+    await openFile(ui, A)
+    await ui.press({ key: 'key-out' })
+    expect(project.opened).toEqual([
+      { focus: true, escape: false },
+      { focus: false, escape: true },
+      { focus: false, escape: false },
+    ])
+  })
+
+  test('Esc asks to close the pane while a note is written on a closed file, which cancels the note', async ($, on) => {
+    const project = await started($, on, { files: { [A]: FIVE } })
+    await edit($, 't1', 'a.ts', 'two', 'TWO')
+    const ui = await mount($)
+    await command($)
+
+    await goTo(ui, FILE)
+    await note(ui, 'Why this file?')
+    await ui.press({ key: 'key-note' })
+    expect(project.opened).toEqual([
+      { focus: true, escape: false },
+      { focus: false, escape: true },
+      { focus: false, escape: false },
+      { focus: false, escape: true },
+    ])
+  })
+
+  test('Esc stops asking to close the pane once the open file leaves the list, as when the review ends', async ($, on) => {
+    const project = await started($, on, { files: { [A]: FIVE } })
+    await edit($, 't1', 'a.ts', 'two', 'TWO')
+    const ui = await mount($)
+    await command($)
+    await openFile(ui, A)
+
+    await ui.press({ key: 'key-reviewed' })
+    expect(await listOf(ui)).toEqual([])
+    expect(project.opened.at(-1)).toEqual({ focus: false, escape: false })
+  })
+
+  test('a pane kept open behind another tab through a restart is asked anew once the keyboard comes to it', async ($, on) => {
+    const project = await started($, on, { files: { [A]: FIVE }, panes: [{ isShown: false }] })
+    await mount($)
+    expect(project.opened).toEqual([])
+
+    project.pane.isShown = true
+    await moveTo($, 'enter')
+    expect(project.opened).toEqual([{ focus: false, escape: false }])
+  })
+
+  test('q is the last key on every row, inside an open file too, and none shows while a note is written', async ($, on) => {
+    await started($, on, { files: { [A]: FIVE } })
+    await edit($, 't1', 'a.ts', 'two', 'TWO')
+    const ui = await mount($)
+    expect((await hotkeysOf(ui)).at(-1)).toBe('q close')
+    await openFile(ui, A)
+    expect((await hotkeysOf(ui)).at(-1)).toBe('q close')
+
+    await ui.press({ key: 'key-note' })
+    expect(await hotkeysOf(ui)).toEqual([])
+  })
+
+  test('q closes the pane, which forgets the open file', async ($, on) => {
+    const project = await started($, on, { files: { [A]: FIVE } })
+    await edit($, 't1', 'a.ts', 'two', 'TWO')
+    const ui = await mount($)
+    await command($)
+    await openFile(ui, A)
+
+    await ui.press({ key: 'key-close' })
+    expect(project.closed).toEqual(['difnote'])
+    expect(await codeOf(ui)).toEqual([])
+  })
+})
+
+// The keys at the bottom, each as its hotkey and label.
+async function hotkeysOf(ui: Mounted): Promise<string[]> {
+  const buttons = await ui.findAll({ type: 'Button' })
+  return buttons.filter(button => button.key?.startsWith('key-') === true).map(button => `${String(button.props.hotkey)} ${button.text ?? ''}`)
+}

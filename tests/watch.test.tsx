@@ -523,6 +523,20 @@ describe('what difnote gives git', () => {
     expect(project.ran.filter(one => one.argv.includes('--add')).map(one => one.stdin)).not.toContainEqual(expect.stringContaining('.env'))
   })
 
+  test('never reads a file named like a secret, not even to send a note on it', async ($, on) => {
+    const secret = `${CWD}/.env`
+    const project = await started($, on, { git: true, files: { [secret]: 'TOKEN=abc\n' } })
+    await shell($, 't1', 'make', { [secret]: 'TOKEN=xyz\n' })
+    const ui = await opened($, project)
+    await goTo(ui, `file:${secret}`)
+    await ui.press({ key: 'key-note' })
+    await ui.input({ key: 'note-field', text: 'Why change this?' })
+
+    await ui.press({ key: 'send' })
+    expect(project.draft.text).toBe('Notes on the changes:\n\n.env\nWhy change this?')
+    expect(project.reads).not.toContain(secret)
+  })
+
   test("no copy of a file named like a secret when its folder can't be listed", async ($, on) => {
     const project = await started($, on, { git: true, files: { [`${CWD}/.env`]: 'TOKEN=abc\n' }, unlisted: [CWD] })
     await opened($, project)
